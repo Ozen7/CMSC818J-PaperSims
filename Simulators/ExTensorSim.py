@@ -3,20 +3,60 @@ import numpy as np
 import scipy.io as sio
 from scipy.sparse import csc_array
 from scipy.sparse import csr_array
+from scipy.sparse import coo_matrix
 
 
-data = sio.mmread('C:\Workspace\CMSC818J\PaperSims\CMSC818J-PaperSims\Simulators\Datasets\mbeacxc.mtx')
-cscData = csc_array(data)
-csrData = csr_array(data)
+sparseMat = sio.mmread('C:\Workspace\CMSC818J\PaperSims\CMSC818J-PaperSims\Simulators\Datasets\mbeacxc.mtx')
 
+class CSFNode:
+    def __init__(self, value):
+        self.value = value
+        self.children = {}
+    
+    def __str__(self) -> str:
+        return coo_to_csf(self)
 
-# Important note: This simulator ONLY works for 2-tensors, as that is what I need for my own testing purposes.
-# As such, it makes use of a COO compression format as opposed to CSF or some other higher-dimensional compression format.
-print(type(data))
-print(cscData.indices)
+def coo_to_csf(coo_matrix):
+    root = CSFNode(None)
 
+    for i, j, data in zip(coo_matrix.row, coo_matrix.col, coo_matrix.data):
+        current_node = root
 
-        
+        # Traverse the tree based on the coordinates
+        for coord in (i, j):
+            if coord not in current_node.children:
+                current_node.children[coord] = CSFNode(None)
+            current_node = current_node.children[coord]
+
+        # Set the leaf node value to the data value
+        if current_node.value != None:
+            current_node.value += data
+        else:
+            current_node.value = data
+
+    return root
+
+# Print the CSF representation (basic representation)
+def print_csf_tree(node, depth=0):
+    if node.value is not None:
+        print(f"{'  ' * depth}Leaf: {node.value}")
+    for coord, child in node.children.items():
+        print(f"{'  ' * depth}Coordinate {coord}:")
+        print_csf_tree(child, depth + 1)
+"""   
+# Create a sample COO matrix
+data = [1, 2, 3, 4, 5,10]
+row = [0, 1, 1, 2, 1,5]
+col = [0, 0, 1, 2, 2,5]
+
+coo_matrix_example = coo_matrix((data, (row, col)), shape=(6, 6))
+
+# Convert COO to CSF
+csf_representation = coo_to_csf(coo_matrix_example)
+
+#print_csf_tree(csf_representation)
+"""
+
 class Scanner:
     
     metadata = []
@@ -26,8 +66,8 @@ class Scanner:
     # Metadata is simply an array of coordinates. By repeatedly intersecting two coordinate streams, we can obtain the 
     # final pairing of operations necessary to get the output.
     def loadData(self, metadata, level, parent_node) -> None:
-        self.metadata = metadata # to make pop() faster
-        self.metadata.reverse()
+        self.metadata = sorted(metadata) 
+        self.metadata.reverse() # to make pop() faster
         self.level = level
         self.parent_node = parent_node
     
@@ -56,13 +96,13 @@ class Intersect:
     def reset(self) -> None:
         self.A = None
         self.B = None
-        self.op = None
-        self.output = np.array([])
-    
-    def set(self,scanner1: Scanner, scanner2: Scanner ) -> None:
+        self.skipTo = False
+          
+    def set(self,scanner1: Scanner, scanner2: Scanner, skipTo: bool ) -> None:
         self.A = scanner1
         self.B = scanner2
-        self.output = np.array([])
+        self.skipTo = skipTo
+        
     
     def getScanner1(self) -> Scanner:
         return self.A
@@ -70,11 +110,9 @@ class Intersect:
     def getScanner2(self) -> Scanner:
         return self.B
 
-    def getOutput(self):
-        #the levels of both should be the same, since its output stationary.
-        return (self.output,self.A.getParentNode(),self.B.getParentNode(), self.A.getLevel())
-    
     def Intersect(self):
+        #NOTE: SkipTo architecture is not directly implemented, and only matters for cycle counting.
+        output = []
         while True:
             if self.A.isEmpty() or self.B.isEmpty():
                 self.A.flush()
@@ -86,38 +124,80 @@ class Intersect:
                 self.B.iterate();
             else:
                 self.B.iterate()
-                self.output = np.append(self.output,(self.A.iterate()))
-                
-                
-# this all will be part of the controller class.
-intersector = Intersect()
-scanner1 = Scanner()
-scanner2 = Scanner()
+                output.append(self.A.iterate())
+        return output
 
+                
+
+      
+def outputStationary(node1: CSFNode,node2: CSFNode,level,node2p):
+    intersector = Intersect()
+    scanner1 = Scanner()
+    scanner2 = Scanner()
+    total = []
+    for i in node1.children:
+        value = node1.children[i]
+        scanner1.loadData(list(value.children.keys()),level+2,i)
+        
+        scanner2.loadData(list(node2.children.keys()),level+1,node2p)
+        
+        intersector.set(scanner1,scanner2, True)
+        
+        for k in intersector.Intersect():
+            for j in node2.children[k].children:
+                total.append((value.children[k],node2.children[k].children[j],i,j))
+            
+    return total
+
+"""
 gen = np.random.default_rng()
-input1 =gen.integers(0,10000,800)
-input2 = gen.integers(0,10000,800)
-input1.sort()
-input2.sort()
+data1 = gen.integers(0,100,5)
+row1 = gen.integers(0,3,5)
+col1 = gen.integers(0,3,5)
 
-scanner1.loadData(list(input1),0,0)
-scanner2.loadData(list(input2),0,0)
+data2 = gen.integers(0,100,5)
+row2 = gen.integers(0,3,5)
+col2 = gen.integers(0,3,5)
+i1 = coo_matrix((data1, (row1, col1)), shape=(3, 3))
+i2 = coo_matrix((data2, (row2, col2)), shape=(3, 3))
 
-intersector.set(scanner1,scanner2)
+input1 = coo_to_csf(i1)
+input2 = coo_to_csf(i2)
 
-intersector.Intersect()
+#print("i1")
+#print_csf_tree(input1)
+#print("i2")
+#print_csf_tree(input2)
 
-for x in intersector.getOutput():
+print(i2.toarray())
+print(i1.toarray())
+
+
+datalist = []
+rowlist = []
+collist = []
+#inter = outputStationary(input1,input2,0,0)
+#for x in inter:
+#    print(x[0].value, x[1].value,x[2],x[3])
+
     
-    #generate new random data for each "column" and "row"
-    input1 =gen.integers(0,10000,800)
-    input2 = gen.integers(0,10000,800)
-    input1.sort()
-    input2.sort()
+#print(len(datalist))
+#out = coo_matrix((datalist,(rowlist,collist)), shape=(3,3))
+#print("out\n",out.toarray())
+#print("matmul\n",np.matmul(i1.toarray(),i2.toarray()))
+"""
 
-    intersector.reset()
-    scanner1.loadData()
-    intersector.set()
+datalist = []
+rowlist = []
+collist = []
+for x in outputStationary(coo_to_csf(sparseMat),coo_to_csf(sparseMat),0,0):
+    datalist.append(x[0].value * x[1].value)
+    rowlist.append(x[2])
+    collist.append(x[3])
 
-print(intersector.getOutput())
-    
+out = coo_matrix((datalist,(rowlist,collist)), shape=(496,496))
+print(out.toarray())
+print(np.matmul(sparseMat.toarray(),sparseMat.toarray()))
+
+print(np.allclose(out.toarray(),np.matmul(sparseMat.toarray(),sparseMat.toarray()),rtol=0.000001))
+ 
