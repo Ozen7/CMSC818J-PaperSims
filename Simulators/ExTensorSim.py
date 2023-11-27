@@ -4,6 +4,7 @@ import scipy.io as sio
 from scipy.sparse import csc_array
 from scipy.sparse import csr_array
 from scipy.sparse import coo_matrix
+import bisect
 
 
 sparseMat = sio.mmread('C:\Workspace\CMSC818J\PaperSims\CMSC818J-PaperSims\Simulators\Datasets\mbeacxc.mtx')
@@ -17,21 +18,21 @@ class CSFNode:
         print_csf_tree(self)
         return "Root"
 
-def coo_to_csf(coo_matrix, LLBxsize, LLBysize, PExsize, PEysize,swap):
+def coo_to_csf(coo_matrix, llbxsize, llbysize, pexsize, peysize,swap):
     root = CSFNode(None)
 
     for i, j, data in zip(coo_matrix.row, coo_matrix.col, coo_matrix.data):
         current_node = root
         
-        a = i // LLBxsize
-        b = j // LLBysize
+        a = i // llbxsize
+        b = j // llbysize
         
-        c = (i - (a * LLBxsize)) // PExsize
-        d = (j - (b * LLBysize)) // PExsize
+        c = (i - (a * llbxsize)) // pexsize
+        d = (j - (b * llbysize)) // pexsize
         
         
-        e = (i - (a * LLBxsize) - (c * PExsize))
-        f = (j - (b * LLBysize) - (d * PEysize))
+        e = (i - (a * llbxsize) - (c * pexsize))
+        f = (j - (b * llbysize) - (d * peysize))
         
         if swap:
             temp = e
@@ -71,7 +72,7 @@ coo_matrix_example = coo_matrix((data, (row, col)), shape=(6, 6))
 csf_representation = coo_to_csf(coo_matrix_example)
 
 #print_csf_tree(csf_representation)
-"""
+
 
 class Scanner:
     
@@ -98,64 +99,88 @@ class Scanner:
     
     def getLevel(self) -> int:
         return self.level
-    
+"""
         
 
     
 
 class Intersect:  
-    def reset(self) -> None:
-        self.A = None
-        self.B = None
-        self.skipTo = False
+    def __init__(self) -> None:
+        self.A = []
+        self.B = []
+        self.skipto = False
           
-    def set(self,scanner1: Scanner, scanner2: Scanner, skipTo: bool ) -> None:
-        self.A = scanner1
-        self.B = scanner2
-        self.skipTo = skipTo
+    def set(self,scanner1: list, scanner2: list, skipto: bool ) -> None:
+        self.A = sorted(scanner1)
+        self.B = sorted(scanner2)
+        self.skipto = skipto
+        
+    def skipToA(self,target: int):
+        index = bisect.bisect_left(self.A, target)
+        if index < len(self.A):
+            self.A = self.A[index:]
+        else:
+            self.A = []
+    
+    def skipToB(self,target: int):
+        index = bisect.bisect_left(self.B, target)
+        if index < len(self.B):
+            self.B = self.B[index:]
+        else:
+            self.B = []
         
     
-    def getScanner1(self) -> Scanner:
+    def getScanner1(self) -> list:
         return self.A
     
-    def getScanner2(self) -> Scanner:
+    def getScanner2(self) -> list:
         return self.B
 
     def Intersect(self):
-        #NOTE: SkipTo architecture is not directly implemented, and only matters for cycle counting.
         output = []
-        while True:
-            if self.A.isEmpty() or self.B.isEmpty():
-                self.A.flush()
-                self.B.flush()
-                break
-            elif self.A.peek() < self.B.peek():
-                self.A.iterate();
-            elif self.A.peek() > self.B.peek():
-                self.B.iterate();
-            else:
-                self.B.iterate()
-                output.append(self.A.iterate())
+        if self.skipto:
+            while True:
+                if self.A == [] or self.B == []:
+                    self.A = []
+                    self.B = []
+                    break
+                elif self.A[0] == self.B[0]:
+                    self.B.pop(0)
+                    output.append(self.A.pop(0))
+                else:
+                    temp = self.A[0]
+                    self.skipToA(self.B[0])
+                    self.skipToB(temp)
+        else:
+            while True:
+                if self.A == [] or self.B == []:
+                    self.A = []
+                    self.B = []
+                    break
+                elif self.A[0] < self.B[0]:
+                    self.A.pop(0);
+                elif self.A[0] > self.B[0]:
+                    self.B.pop(0);
+                else:
+                    self.B.pop(0)
+                    output.append(self.A.pop(0))
         return output
 
                 
 
 # Node 1 Stationary.
-def nodeStationary(node1: CSFNode, node2: CSFNode, level, reverse):
+def nodeStationary(node1: CSFNode, node2: CSFNode, reverse):
     intersector = Intersect()
-    scanner1 = Scanner()
-    scanner2 = Scanner()
     total = []
     for i in node1.children:
         value = node1.children[i]
-        scanner1.loadData(list(value.children.keys()),level+2)
-        
-        scanner2.loadData(list(node2.children.keys()),level+1)
-        
-        intersector.set(scanner1,scanner2, True)
+
+        intersector.set(list(value.children.keys()),list(node2.children.keys()), skipto=True)
         
         for k in intersector.Intersect():
             for j in node2.children[k].children:
+                # add in reversing so I don't have to deal with the headache of indices swapping 
+                # when I want to mix matrix A and B stationary
                 if reverse:
                     total.append((node2.children[k].children[j],value.children[k],i,j))
                 else:
@@ -163,19 +188,14 @@ def nodeStationary(node1: CSFNode, node2: CSFNode, level, reverse):
             
     return total
 
-def outputStationary(node1: CSFNode, node2: CSFNode, level):
+def outputStationary(node1: CSFNode, node2: CSFNode):
     intersector = Intersect()
-    scanner1 = Scanner()
-    scanner2 = Scanner()
     total = []
     for i in node1.children:
         for j in node2.children:
             value1 = node1.children[i]
             value2 = node2.children[j]
-            scanner1.loadData(list(value1.children.keys()),level + 2)
-            scanner2.loadData(list(value2.children.keys()),level + 2)
-            intersector.set(scanner1,scanner2, True)
-            
+            intersector.set(list(value1.children.keys()),list(value2.children.keys()), skipto=True)
             for k in intersector.Intersect():
                 total.append((value1.children[k],value2.children[k],i,j))
     return total
@@ -229,11 +249,11 @@ datalist = []
 rowlist = []
 collist = []
 
-output1 = nodeStationary(coo_to_csf(sparseMat, 25, 25, 5, 5,False), coo_to_csf(sparseMat, 25, 25, 5, 5,True),0,False)
+output1 = nodeStationary(coo_to_csf(sparseMat, 25, 25, 5, 5,False), coo_to_csf(sparseMat, 25, 25, 5, 5,True),False)
 for x in output1:
-    output2 = nodeStationary(x[0],x[1],2,True)
+    output2 = nodeStationary(x[0],x[1],True)
     for y in output2:
-        output3 = outputStationary(y[0],y[1],4)
+        output3 = outputStationary(y[0],y[1])
         for z in output3:
             datalist.append(z[0].value * z[1].value)
             # switch up z values since they were swapped in the original array.
