@@ -1,18 +1,19 @@
-from typing import Callable
 import numpy as np
 import scipy.io as sio
-from scipy.sparse import csc_array
-from scipy.sparse import csr_array
 from scipy.sparse import coo_matrix
 import bisect
 
 
 sparseMat = sio.mmread('C:\Workspace\CMSC818J\PaperSims\CMSC818J-PaperSims\Simulators\Datasets\mbeacxc.mtx')
+print(len(sparseMat.data))
+global numCycles
+numCycles = 0
 
 class CSFNode:
     def __init__(self, value):
         self.value = value
         self.children = {}
+        self.used = False
     
     def __str__(self) -> str:
         print_csf_tree(self)
@@ -111,6 +112,9 @@ class Intersect:
         self.skipto = False
           
     def set(self,scanner1: list, scanner2: list, skipto: bool ) -> None:
+        global intsLoaded
+        global numCycles
+        numCycles += 1
         self.A = sorted(scanner1)
         self.B = sorted(scanner2)
         self.skipto = skipto
@@ -137,9 +141,11 @@ class Intersect:
         return self.B
 
     def Intersect(self):
+        global numCycles
         output = []
         if self.skipto:
             while True:
+                numCycles += 1
                 if self.A == [] or self.B == []:
                     self.A = []
                     self.B = []
@@ -153,6 +159,7 @@ class Intersect:
                     self.skipToB(temp)
         else:
             while True:
+                numCycles += 1
                 if self.A == [] or self.B == []:
                     self.A = []
                     self.B = []
@@ -170,15 +177,19 @@ class Intersect:
 
 # Node 1 Stationary.
 def nodeStationary(node1: CSFNode, node2: CSFNode, reverse):
+    node1.used = True
+    node2.used = True
     intersector = Intersect()
     total = []
     for i in node1.children:
         value = node1.children[i]
+        value.used = True
 
         intersector.set(list(value.children.keys()),list(node2.children.keys()), skipto=True)
         
         for k in intersector.Intersect():
             for j in node2.children[k].children:
+                node2.children[k].used = True
                 # add in reversing so I don't have to deal with the headache of indices swapping 
                 # when I want to mix matrix A and B stationary
                 if reverse:
@@ -189,12 +200,16 @@ def nodeStationary(node1: CSFNode, node2: CSFNode, reverse):
     return total
 
 def outputStationary(node1: CSFNode, node2: CSFNode):
+    node1.used = True
+    node2.used = True
     intersector = Intersect()
     total = []
     for i in node1.children:
         for j in node2.children:
             value1 = node1.children[i]
             value2 = node2.children[j]
+            value1.used = True
+            value2.used = True
             intersector.set(list(value1.children.keys()),list(value2.children.keys()), skipto=True)
             for k in intersector.Intersect():
                 total.append((value1.children[k],value2.children[k],i,j))
@@ -202,13 +217,13 @@ def outputStationary(node1: CSFNode, node2: CSFNode):
 
 """
 gen = np.random.default_rng()
-data1 = gen.integers(0,10,5)
-row1 = gen.integers(0,5,5)
-col1 = gen.integers(0,5,5)
+data1 = gen.integers(0,10,10)
+row1 = gen.integers(0,5,10)
+col1 = gen.integers(0,5,10)
 
-data2 = gen.integers(0,10,5)
-row2 = gen.integers(0,5,5)
-col2 = gen.integers(0,5,5)
+data2 = gen.integers(0,10,10)
+row2 = gen.integers(0,5,10)
+col2 = gen.integers(0,5,10)
 i1 = coo_matrix((data1, (row1, col1)), shape=(5, 5))
 i2 = coo_matrix((data2, (row2, col2)), shape=(5, 5))
 
@@ -227,34 +242,39 @@ print(i1.toarray())
 datalist = []
 rowlist = []
 collist = []
-output1 = nodeStationary(input1,input2,0,False)
-for x in output1:
-    output2 = nodeStationary(x[0],x[1],2,True)
-    for y in output2:
-        output3 = outputStationary(y[0],y[1],4)
-        for z in output3:
-            datalist.append(z[0].value * z[1].value)
-            rowlist.append(x[2]*3 + y[2]*2 + z[3])
-            collist.append(x[3]*3 + y[3]*2 + z[2])
-
-print(rowlist)
-print(collist)
-print(len(datalist))
-out = coo_matrix((datalist,(rowlist,collist)), shape=(5,5))
-print("out\n",out.toarray())
-print("matmul\n",np.matmul(i1.toarray(),i2.toarray()))
-"""
-
-datalist = []
-rowlist = []
-collist = []
-
-output1 = nodeStationary(coo_to_csf(sparseMat, 25, 25, 5, 5,False), coo_to_csf(sparseMat, 25, 25, 5, 5,True),False)
+output1 = nodeStationary(input1,input2,False)
 for x in output1:
     output2 = nodeStationary(x[0],x[1],True)
     for y in output2:
         output3 = outputStationary(y[0],y[1])
         for z in output3:
+            numCycles += 1 # assuming multiplication takes one cycle
+            datalist.append(z[0].value * z[1].value)
+            rowlist.append(x[2]*3 + y[2]*2 + z[3])
+            collist.append(x[3]*3 + y[3]*2 + z[2])
+
+out = coo_matrix((datalist,(rowlist,collist)), shape=(5,5))
+print("out\n",out.toarray())
+print("matmul\n",np.matmul(i1.toarray(),i2.toarray()))
+
+"""
+
+datalist = []
+rowlist = []
+collist = []
+intsLoaded = 0
+
+input1 = coo_to_csf(sparseMat, 25, 25, 5, 5,False)
+input2 = coo_to_csf(sparseMat, 25, 25, 5, 5,True)
+
+output1 = nodeStationary(input1, input2,False)
+for x in output1:
+    output2 = nodeStationary(x[0],x[1],True)
+    for y in output2:
+        output3 = outputStationary(y[0],y[1])
+        for z in output3:
+            numCycles += 1 # assuming multiplication takes one cycle
+            
             datalist.append(z[0].value * z[1].value)
             # switch up z values since they were swapped in the original array.
             rowlist.append(x[2]*25 + y[2]*5 + z[3])
@@ -264,7 +284,17 @@ for x in output1:
     #rowlist.append(x[2])
     #collist.append(x[3])
 out = coo_matrix((datalist,(rowlist,collist)), shape=(496,496))
-print(out.toarray())
-print(np.matmul(sparseMat.toarray(),sparseMat.toarray()))
-print(np.array_equal(out.toarray() == 0, np.matmul(sparseMat.toarray(),sparseMat.toarray()) == 0 ))
-print(np.allclose(out.toarray(),np.matmul(sparseMat.toarray(),sparseMat.toarray()),rtol=0.000001))
+
+
+# Calculate the number of integers loaded from memory by going through the CSFNode tree and counting the number of used nodes.
+
+def count_csf_tree(node):
+    intsLoaded = 0
+    if node.used:
+        intsLoaded += 1
+        for child in node.children.values():
+            intsLoaded += count_csf_tree(child)
+    return intsLoaded
+   
+print("Cycles:", numCycles)
+print("Integers Loaded From Memory:", count_csf_tree(input1) + count_csf_tree(input2)) 
