@@ -4,8 +4,9 @@ from scipy.sparse import csr_matrix
 from scipy.sparse import coo_matrix
 
 import scipy.io as sio
+import scipy.spatial
 
-sparseMat = sio.mmread('C:\Workspace\CMSC818J\PaperSims\CMSC818J-PaperSims\Simulators\Datasets\mbeacxc.mtx')
+
 
 
 # Step 1: Convert CSR to C2SR - C2SR basically just makes sure that all the data a PE reads at a given time is useful.
@@ -66,6 +67,8 @@ print("C2SR Row Pointers:", c2sr_row_pointer)
 
 class PE:
     def __init__(self,queuesize,queuenum):
+        self.phase1Cycles = 0
+        self.phase2Cycles = 0
         self.queuenum = queuenum
         self.queuesize = queuesize
         self.queuelist = [deque(maxlen=queuesize) for x in range(0,queuenum)]
@@ -73,8 +76,13 @@ class PE:
         self.nomerge = True
         self.kprev = -1
     
+    def getNumCycles(self):
+        return (self.phase1Cycles, self.phase2Cycles)
+    
     def reset(self):
         self.queuelist = [deque(maxlen=self.queuesize) for x in range(0,self.queuenum)]
+        self.phase1Cycles = 0
+        self.phase2Cycles = 0
         self.helperqueue = 0
         self.nomerge = True
         self.kprev = -1
@@ -121,7 +129,7 @@ class PE:
             else:
                 self.nomerge = False
                 
-        
+        self.phase1Cycles += 1 # one cycle for each multiplication, the merging and accumulation is masked by another multiplication
         c = a * b
         self.merge(c,i,j)
     
@@ -129,7 +137,6 @@ class PE:
         data = []
         indices = []
         while True:
-            
             firstcols = np.zeros(self.queuenum)
             for x in range(self.queuenum):
                 if self.queuelist[x]:
@@ -144,13 +151,18 @@ class PE:
             else:
                 break
             
+            # find minimum values across all queues and accumulate them. according to the paper, this ONLY takes one cycle. 
+            # "In the case when multiple queues have the same minimum column index at the top of the queue, all such queues are popped and
+            # the sum of popped elements is streamed to the main memory"
+            # Note that there is a dedicated portion that keeps track of the minimum column IDs as well as an adder tree, so this isn't too 
+            # far fetched, even if the addition should probably technically take more than one cycle.
+            self.phase2Cycles += 1
             mins = np.where(firstcols == firstcols.min())[0]
             indices.append(self.queuelist[mins[0]][0][1])
 
             for num in mins:
                 total += self.queuelist[num].popleft()[0]
             data.append(total)
-        self.reset()
         return (data, indices)
         
             
@@ -163,17 +175,24 @@ class Controller:
         #Both of these are converted to C2SR format.
         self.A_values, self.A_column_ids, self.A_row_lengths, self.A_row_pointers = csr_to_c2sr(A.data, A.indices,A.indptr,numchannels)
         self.B_values, self.B_column_ids, self.B_row_lengths, self.B_row_pointers = csr_to_c2sr(B.data, B.indices,B.indptr,numchannels)
-        
+
         self.outputshape = (A.shape[0], B.shape[1])
         
         self.pes = [PE(queuesize=queuelengths,queuenum=queuenum) for x in range(numchannels)]
             
         self.numchannels = numchannels
+        
+        self.peNumCycles = [[0,0] for x in range(self.numchannels)]
+    
+    def obtainMaxCycles(self):
+        return max(map(lambda x : x[0] + x[1], self.peNumCycles))
     
     def compute(self):
         indices = []
         indptr = []
         data = []
+        channel = 0
+        finaladd = 0
         for row in range(len(self.A_row_lengths)):
             channel = row % self.numchannels
             PE = self.pes[channel]
@@ -189,9 +208,15 @@ class Controller:
                     bcol = self.B_column_ids[browchannel][browstart + b]
                     PE.compute(adata,bdata,row,acol,bcol)
             (d, i) = PE.accumulateandoutput()
+            (phase1,phase2) = PE.getNumCycles()
+            self.peNumCycles[channel][0] += max(phase1,self.peNumCycles[channel][1])
+            self.peNumCycles[channel][1] = phase2
+            finaladd = phase2
+            PE.reset()
             indptr.append(len(data))
             indices += i
             data += d
+        self.peNumCycles[channel][0] += finaladd
         indptr.append(len(data))
         
         if indptr != []:
@@ -215,7 +240,8 @@ col2 = gen.integers(0,5,5)
 i1 = coo_matrix((data1, (row1, col1)), shape=(5, 5))
 i2 = coo_matrix((data2, (row2, col2)), shape=(5, 5))
 
-#controller = Controller(csr_matrix(i1),csr_matrix(i2),10,10,100)
+'''
+sparseMat = sio.mmread('C:\Workspace\CMSC818J\PaperSims\CMSC818J-PaperSims\Simulators\Datasets\mbeacxc.mtx')
 controller = Controller(csr_matrix(sparseMat),csr_matrix(sparseMat),10,100000,100)
 
 out = controller.compute()
@@ -227,6 +253,50 @@ print(np.matmul(sparseMat.toarray(),sparseMat.toarray()))
 print(np.equal(out.toarray(), np.matmul(sparseMat.toarray(),sparseMat.toarray())))
 print(np.allclose(out.toarray(),np.matmul(sparseMat.toarray(),sparseMat.toarray()),rtol=0.000001))
 
+'''
+#controller = Controller(csr_matrix(i1),csr_matrix(i2),10,10,100)
+
+# input matrices are in CSR format
+def run_matraptor(matrix1,matrix2):
+    csr_m1 = csr_matrix(matrix1)
+    csr_m2 = csr_matrix(matrix2)
+
+    controller = Controller(csr_m1,csr_m2,10,100000,100)
+
+    out = controller.compute()
+
+    #   size calculation
+    c2srMat1 = csr_to_c2sr(csr_m1.data, csr_m1.indices, csr_m1.indptr, num_channels=10)
+    c2srMat2 = csr_to_c2sr(csr_m2.data, csr_m2.indices, csr_m2.indptr, num_channels=10)
+
+    total_size = 0
+
+    for sublist in c2srMat1[0]:
+        total_size += len(sublist)
+    for sublist in c2srMat1[1]:
+        total_size += len(sublist)
+
+    total_size += len(c2srMat1[2])
+    total_size += len(c2srMat1[3])
+    
+    for sublist in c2srMat2[0]:
+        total_size += len(sublist)
+    for sublist in c2srMat2[1]:
+        total_size += len(sublist)
+
+    total_size += len(c2srMat2[2])
+    total_size += len(c2srMat2[3])
+    
+
+    print("number of cycles:", controller.obtainMaxCycles())
+    print("Data Pulled from DRAM:", total_size)
+    if matrix1.size >= 10000 or matrix2.size >= 10000:
+        print("matrices too large to verify")
+    else:
+        trueval = matrix1 @ matrix2
+        print("Verify that sparse multiplication is correct: ", np.allclose(out.toarray(),trueval.toarray(),rtol=0.000001))
+
+# run_matraptor(sparseMat,sparseMat)
 # pe = PE(50)
 
 # A
