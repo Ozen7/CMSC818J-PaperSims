@@ -39,31 +39,31 @@ print("Random Sparse Matrices:")
 
 print("\n\nsparse matrix 1 (1000,1000,0.01) x sparse matrix 1 (1000,1000,0.01)")
 
-print("MatRaptor")
+print("\n---------MatRaptor---------")
 run_matraptor(sparse_matrix_1,sparse_matrix_1)
 
-print("ExTensor")
+print("\n---------ExTensor---------")
 run_extensor(sparse_matrix_1,sparse_matrix_1,30,10)
 
 print("\n\nsparse matrix 1 (1000,1000,0.01) x sparse matrix 2 (1000,1000,0.1)")
 
-print("MatRaptor")
+print("\n---------MatRaptor---------")
 run_matraptor(sparse_matrix_1,sparse_matrix_2)
 
-print("ExTensor")
+print("\n---------ExTensor---------")
 run_extensor(sparse_matrix_1,sparse_matrix_2,30,10)
 
 print("\n\nsparse matrix 1 (1000,1000,0.01) x sparse matrix 3 (1000,500,1)")
 
-print("MatRaptor")
+print("\n---------MatRaptor---------")
 run_matraptor(sparse_matrix_1,sparse_matrix_3)
 
-print("ExTensor")
+print("\n---------ExTensor---------")
 run_extensor(sparse_matrix_1,sparse_matrix_3,30,10)
 
 print("\n\nsparse matrix 2 (1000,1000,0.1) x sparse matrix 3 (1000,500,1)")
 
-print("MatRaptor")
+print("\n---------MatRaptor---------")
 run_matraptor(sparse_matrix_2,sparse_matrix_3)
 
 print("ExTensor")
@@ -71,10 +71,10 @@ run_extensor(sparse_matrix_2,sparse_matrix_3,30,10)
 
 print("\n\nsparse matrix 3 (1000,500,1) x sparse matrix 4 (500,1000,10)")
 
-print("MatRaptor")
+print("\n---------MatRaptor---------")
 run_matraptor(sparse_matrix_3,sparse_matrix_4)
 
-print("ExTensor")
+print("\n---------ExTensor---------")
 run_extensor(sparse_matrix_3,sparse_matrix_4,30,10)
 
 

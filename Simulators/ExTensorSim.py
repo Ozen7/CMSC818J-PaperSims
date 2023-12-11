@@ -260,6 +260,7 @@ print("matmul\n",np.matmul(i1.toarray(),i2.toarray()))
 def count_csf_tree(node):
     intsLoaded = 0
     if node.used:
+        node.used = False
         intsLoaded += 1
         for child in node.children.values():
             intsLoaded += count_csf_tree(child)
@@ -270,28 +271,42 @@ def run_extensor(matrix1, matrix2, l1tile, l2tile):
     rowlist = []
     collist = []
     global numCycles
-    numCycles = [0 for x in range(12)] # 1 DRAM, 1 LLB, 10 PEs
-    
+    numCycles = [0 for _ in range(12)] # 1 DRAM, 1 LLB, 10 PEs
+    lastIterCycles = [0 for _ in range(10)]
+    datacount = 0
+    totalcycles = 0
     coo_m1 = coo_matrix(matrix1)
     coo_m2 = coo_matrix(matrix2)
-
     input1 = coo_to_csf(coo_m1, l1tile, l1tile, l2tile, l2tile,False)
     input2 = coo_to_csf(coo_m2, l1tile, l1tile, l2tile, l2tile,True)
     output1 = nodeStationary(input1, input2,False,0)
     for x in output1:
+        datacount += 2
         output2 = nodeStationary(x[0],x[1],True,1)
         count = 0
         for y in output2:
+            lastIterCycles = [0 for _ in range(10)]
             output3 = outputStationary(y[0],y[1],2 + np.argmin(numCycles[2:]))
             count += 1
             for z in output3:
-                numCycles[count % 10 + 2] += 1 # assuming multiplication takes one cycle
-                
+                lastIterCycles[ count%10 ] += 1
                 datalist.append(z[0].value * z[1].value)
                 # switch up z values since they were swapped in the original array.
                 rowlist.append(x[2]*l1tile + y[2]*l2tile + z[3])
                 collist.append(x[3]*l1tile + y[3]*l2tile + z[2])
+        
+        datacount += count_csf_tree(x[0])
+        datacount += count_csf_tree(x[1])
+        
+        if max(numCycles[2:12]) > numCycles[1]:
+            totalcycles += max(numCycles[2:12])
+        else:
+            totalcycles += numCycles[1] + max(lastIterCycles)
             
+        numCycles = [0 for _ in range(12)]
+        lastIterCycles = [0 for _ in range(10)]
+            
+        
         #datalist.append(x[0].value * x[1].value)
         #rowlist.append(x[2])
         #collist.append(x[3])
@@ -299,8 +314,8 @@ def run_extensor(matrix1, matrix2, l1tile, l2tile):
     # Calculate the number of integers loaded from memory by going through the CSFNode tree and counting the number of used nodes.
 
     print("Cycles:", numCycles)
-    print("Total Cycles (parallel)", numCycles[0] + numCycles[1] + max(numCycles[2:]))
-    print("Integers Loaded From Memory:", count_csf_tree(input1) + count_csf_tree(input2))
+    print("Total Cycles (parallel)", totalcycles)
+    print("Integers Loaded From Memory:", datacount)
     if matrix1.size >= 10000 or matrix2.size >= 10000:
         print("matrices too large to verify")
     else:
