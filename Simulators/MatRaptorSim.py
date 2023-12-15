@@ -12,8 +12,8 @@ import scipy.spatial
 # Step 1: Convert CSR to C2SR - C2SR basically just makes sure that all the data a PE reads at a given time is useful.
 def csr_to_c2sr(data, indices, indptr, num_channels):
     # Create arrays to store C2SR format data
-    c2sr_values = [[] for x in range(num_channels)]
-    c2sr_column_ids = [[] for x in range(num_channels)]
+    c2sr_values = [[] for _ in range(num_channels)]
+    c2sr_column_ids = [[] for _ in range(num_channels)]
     c2sr_row_length = []
     c2sr_row_pointer = []
 
@@ -71,7 +71,7 @@ class PE:
         self.phase2Cycles = 0
         self.queuenum = queuenum
         self.queuesize = queuesize
-        self.queuelist = [deque(maxlen=queuesize) for x in range(0,queuenum)]
+        self.queuelist = [deque(maxlen=queuesize) for _ in range(0,queuenum)]
         self.helperqueue = 0
         self.nomerge = True
         self.kprev = -1
@@ -80,7 +80,7 @@ class PE:
         return (self.phase1Cycles, self.phase2Cycles)
     
     def reset(self):
-        self.queuelist = [deque(maxlen=self.queuesize) for x in range(0,self.queuenum)]
+        self.queuelist = [deque(maxlen=self.queuesize) for _ in range(0,self.queuenum)]
         self.phase1Cycles = 0
         self.phase2Cycles = 0
         self.helperqueue = 0
@@ -111,7 +111,7 @@ class PE:
             # if we DID merge in the previous vector with another queue, we now flush the remaining values into the helper queue.
             # the now-empty queue we merged into is now the helper queue
             if not self.nomerge:
-                for x in range(0,len(self.queuelist[self.currentqueue])):
+                for _ in range(0,len(self.queuelist[self.currentqueue])):
                     self.queuelist[self.helperqueue].append(self.queuelist[self.currentqueue].popleft())
                     
                 assert(len(self.queuelist[self.currentqueue]) == 0)
@@ -178,11 +178,11 @@ class Controller:
 
         self.outputshape = (A.shape[0], B.shape[1])
         
-        self.pes = [PE(queuesize=queuelengths,queuenum=queuenum) for x in range(numchannels)]
+        self.pes = [PE(queuesize=queuelengths,queuenum=queuenum) for _ in range(numchannels)]
             
         self.numchannels = numchannels
         
-        self.peNumCycles = [[0,0] for x in range(self.numchannels)]
+        self.peNumCycles = [[0,0] for _ in range(self.numchannels)]
     
     def obtainMaxCycles(self):
         return max(map(lambda x : x[0] + x[1], self.peNumCycles))
