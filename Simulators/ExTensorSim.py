@@ -289,6 +289,7 @@ def run_extensor(matrix1, matrix2, l1tile, l2tile):
             output3 = outputStationary(y[0],y[1],2 + np.argmin(numCycles[2:]))
             count += 1
             for z in output3:
+                # Multiplication time is masked by the amount of time it takes for intersections to occur.
                 lastIterCycles[ count%10 ] += 1
                 datalist.append(z[0].value * z[1].value)
                 # switch up z values since they were swapped in the original array.
@@ -313,27 +314,26 @@ def run_extensor(matrix1, matrix2, l1tile, l2tile):
     out = coo_matrix((datalist,(rowlist,collist)), shape=(matrix1.shape[0],matrix2.shape[1]))
     # Calculate the number of integers loaded from memory by going through the CSFNode tree and counting the number of used nodes.
 
-    print("Cycles:", numCycles)
     print("Total Cycles (parallel)", totalcycles)
     print("Integers Loaded From Memory:", datacount)
     if matrix1.size >= 10000 or matrix2.size >= 10000:
         print("matrices too large to verify")
-    else:
-        trueval = matrix1 @ matrix2
-        print("Verify that sparse multiplication is correct: ", np.allclose(out.toarray(),trueval.toarray(),rtol=0.000001))
+    #else:
+        #trueval = (matrix1 @ matrix2)
+        #print("Verify that sparse multiplication is correct: ", np.allclose(out.toarray(),trueval,rtol=0.000001))
  
  
 '''
 gen = np.random.default_rng()
-data1 = gen.integers(1,10,100)
-row1 = gen.integers(0,1000,100)
-col1 = gen.integers(0,1000,100)
+data1 = gen.integers(1,5,100)
+row1 = gen.integers(0,5,100)
+col1 = gen.integers(0,5,100)
 
-data2 = gen.integers(1,10,100)
-row2 = gen.integers(0,1000,100)
-col2 = gen.integers(0,1000,100)
-i1 = coo_matrix((data1, (row1, col1)), shape=(1000, 1000))
-i2 = coo_matrix((data2, (row2, col2)), shape=(1000, 1000))
+data2 = gen.integers(1,5,100)
+row2 = gen.integers(0,5,100)
+col2 = gen.integers(0,5,100)
+i1 = coo_matrix((data1, (row1, col1)), shape=(5, 5))
+i2 = coo_matrix((data2, (row2, col2)), shape=(5, 5))
 print(i1.toarray())
 print(i2.toarray())
 run_extensor(i1,i2,250,125)

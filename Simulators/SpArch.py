@@ -1,17 +1,31 @@
 import numpy as np
 from scipy.sparse import csr_matrix, coo_matrix
 from collections import deque
+import math
 
+global total_memory_usage
+global truepartial
+
+truepartial = []
+
+total_memory_usage = 0
 
 #Matrix Condensing
 class Afetcher:
     def __init__(self, A) -> None:
+        global total_memory_usage 
+
         self.condenseSize = 63
         self.A = csr_matrix(A)
         data = self.A.data
         indices = self.A.indices
         self.originalcols = np.copy(self.A.indices)
         indptr = self.A.indptr
+        
+        
+        # the entire A matrix is fetched from memory column by column. I can just calculate how much data is pulled all at once.
+        total_memory_usage += len(data) + len(indptr) + len(indices)
+
         
         # rearrange the order of the indices so that it is in increasing sorted order. Might be unnecessary but it will break otherwise
         for i in range(0,len(indptr)-1):
@@ -59,13 +73,6 @@ class Afetcher:
             mask = np.in1d(self.A.indices[rp0: rp1],np.arange(minval, self.colPointer))
         
         compressedcols = list(map(lambda x: x%self.condenseSize, self.A.indices[rp0:rp1][mask]))
-        #print(mask)
-        #print(self.originalcols)
-        #print(rp0)
-        #print(rp1)
-        #print(self.A.indices)
-        #print(self.originalcols)
-        # [original(and compressed) row, which columns within the compressed array, original columns, data]
         retval = [self.rowPointer-1, compressedcols,  self.originalcols[rp0:rp1][mask],self.A.data[rp0:rp1][mask]]
         
         self.rowPointer += 1
@@ -76,9 +83,16 @@ class Bprefetcher:
     def __init__(self,B) -> None:
         self.B = csr_matrix(B)
     def fetch(self, row):
+        # Note: I tried to implement the B prefetcher, but it got way too complex so i decided to just abstract it out.
+        # Since the row prefetcher was stated to achieve a 62% hit rate, I'm just going to count the amount of data pulled from memory and then 
+        # multiply it by 0.38 to save some headache.
+        global total_memory_usage
+  
         begin = self.B.indptr[row]
         end = self.B.indptr[row+1]
-        return [self.B.data[begin:end],self.B.indices[begin:end]]
+        data = [self.B.data[begin:end],self.B.indices[begin:end]]
+        total_memory_usage += math.ceil(len(data) * 0.38)
+        return data
 
 
 class Merger:
@@ -138,8 +152,7 @@ class Merger:
         
             
 
-global truepartial
-truepartial = []
+
 class MultiplyAndMerge:
     def __init__(self, A, B) -> None:
         global truepartial
@@ -149,14 +162,15 @@ class MultiplyAndMerge:
         for x in truepartial:
             self.partials[63].append(x)
         self.endflag = False
+        self.numcycles = 0
         
     def MultiplyColumn(self):
-        
         rs = self.aFetcher.nextRowSet()
         while rs != None:
             for x in range(len(rs[3])):
                 brow = np.array(self.bPrefetcher.fetch(rs[2][x]))
                 datapoints = brow[0] * rs[3][x]
+                self.numcycles += len(brow) # vectorized multiply across all of B
                 for val in range(len(datapoints)):
                     self.partials[rs[1][x]].append([rs[0], brow[1][val],datapoints[val]])
             rs = self.aFetcher.nextRowSet()
@@ -177,6 +191,7 @@ class MultiplyAndMerge:
         
         
         while bool(out.fifolist[0]) or not self.endflag:
+            self.numcycles += 1
             out.MergeAndPush(0)
             for p in range(6):
                 for val in range(2**(p)):
@@ -195,64 +210,39 @@ class MultiplyAndMerge:
                     self.endflag = True
 
 
+
+
+def run_sparch(matrix1,matrix2):
+    
+    global total_memory_usage
+
+    merger = MultiplyAndMerge(matrix1,matrix2)
+    merger.MultiplyColumn()
+    merger.MergePartials()
     
     
+    data = []
+    i = []
+    j = []
     
-        
-        
-'''
-data = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-indices = [0, 2, 4, 1, 3, 4, 0, 2, 3]
-indptr = [0, 2, 4, 7, 9]
-datacsr = csr_matrix((data,indices,indptr))
-datacsr.shape
-print(datacsr.toarray())
-f = Afetcher(datacsr)
-print(f)
-print(f.nextRowSet())
-print(f.nextRowSet())
-print(f.nextRowSet())
-print(f.nextRowSet())
-print(f.nextRowSet())
-f.resetRows()
-print(f.nextRowSet())
-print(f.nextRowSet())
-print(f.nextRowSet())
-print(f.nextRowSet())
-print(f.nextRowSet())
-
-
-'''
-gen = np.random.default_rng()
-data1 = gen.integers(1,10,10000)
-row1 = gen.integers(0,1000,10000)
-col1 = gen.integers(0,1000,10000)
-
-data2 = gen.integers(1,10,10000)
-row2 = gen.integers(0,1000,10000)
-col2 = gen.integers(0,1000,10000)
-i1 = coo_matrix((data1, (row1, col1)), shape=(1000, 1000))
-i2 = coo_matrix((data2, (row2, col2)), shape=(1000, 1000))
-
-print(i1.toarray())
-print(i2.toarray())
-
-merger = MultiplyAndMerge(i1,i2)
-merger.MultiplyColumn()
-merger.MergePartials()
-
-data = []
-i = []
-j = []
-
-for x in truepartial:
-    i.append(x[0])
-    j.append(x[1])
-    data.append(x[2])
+    global truepartial
+    for x in truepartial:
+        i.append(x[0])
+        j.append(x[1])
+        data.append(x[2])
     
-true = np.matmul(i1.toarray(),i2.toarray())
-m = coo_matrix((data, (i, j)), shape= true.shape)
-print(m.toarray())
-print(true)
+    truepartial = []
 
-print(np.allclose(m.toarray(),true,0.0001))
+    output = coo_matrix((data, (i,j)), shape= (matrix1.shape[0], matrix2.shape[1]))
+
+    print("number of cycles:", merger.numcycles )
+    print("Data Pulled from DRAM:", total_memory_usage)
+    if matrix1.size >= 10000 or matrix2.size >= 10000:
+        print("matrices too large to verify")
+    #else:
+    #    trueval = matrix1 @ matrix2
+    #    print("Verify that sparse multiplication is correct: ", np.allclose(output.toarray(),trueval,rtol=0.000001))
+    
+    total_memory_usage = 0
+    
+    

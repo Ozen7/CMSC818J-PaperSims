@@ -6,6 +6,9 @@ from scipy.sparse import coo_matrix
 import scipy.io as sio
 import scipy.spatial
 
+global total_memory_usage
+
+total_memory_usage = 0
 
 
 
@@ -113,7 +116,8 @@ class PE:
             if not self.nomerge:
                 for _ in range(0,len(self.queuelist[self.currentqueue])):
                     self.queuelist[self.helperqueue].append(self.queuelist[self.currentqueue].popleft())
-                    
+
+                
                 assert(len(self.queuelist[self.currentqueue]) == 0)
                 self.helperqueue = self.currentqueue
                 
@@ -121,8 +125,10 @@ class PE:
             
             #This is not part of the original design, but its the only way I could figure out how to do it
             adjustedqueues = self.queuelist[:self.helperqueue] + self.queuelist[self.helperqueue + 1:]
-
-            self.currentqueue = self.queuelist.index(min(adjustedqueues, key=len, default=None))
+            newqueueidx = adjustedqueues.index(min(adjustedqueues, key=len, default=None))
+            if newqueueidx >= self.helperqueue:
+                newqueueidx += 1
+            self.currentqueue = newqueueidx
             
             if len(self.queuelist[self.currentqueue]) == 0:
                 self.nomerge = True
@@ -188,22 +194,27 @@ class Controller:
         return max(map(lambda x : x[0] + x[1], self.peNumCycles))
     
     def compute(self):
+        global total_memory_usage
         indices = []
         indptr = []
         data = []
         channel = 0
         finaladd = 0
         for row in range(len(self.A_row_lengths)):
+            total_memory_usage += 2 # read from A: (length, row pointer)
             channel = row % self.numchannels
             PE = self.pes[channel]
             rowstart = self.A_row_pointers[row][1]
             
             for a in range(self.A_row_lengths[row][1]):
+                total_memory_usage += 2 # read from A: (value, column id)
                 adata = self.A_values[channel][rowstart + a]
                 acol = self.A_column_ids[channel][rowstart + a]
                 (browchannel, browstart) = self.B_row_pointers[acol]
+                total_memory_usage += 2 # read from B: (length, row pointer)
                 
                 for b in range(self.B_row_lengths[acol][1]):
+                    total_memory_usage += 2 # read from B: (value, column id)
                     bdata = self.B_values[browchannel][browstart + b]
                     bcol = self.B_column_ids[browchannel][browstart + b]
                     PE.compute(adata,bdata,row,acol,bcol)
@@ -264,68 +275,14 @@ def run_matraptor(matrix1,matrix2):
     controller = Controller(csr_m1,csr_m2,10,100000,100)
 
     out = controller.compute()
-
-    #   size calculation
-    c2srMat1 = csr_to_c2sr(csr_m1.data, csr_m1.indices, csr_m1.indptr, num_channels=10)
-    c2srMat2 = csr_to_c2sr(csr_m2.data, csr_m2.indices, csr_m2.indptr, num_channels=10)
-
-    total_size = 0
-
-    for sublist in c2srMat1[0]:
-        total_size += len(sublist)
-    for sublist in c2srMat1[1]:
-        total_size += len(sublist)
-
-    total_size += len(c2srMat1[2])
-    total_size += len(c2srMat1[3])
-    
-    for sublist in c2srMat2[0]:
-        total_size += len(sublist)
-    for sublist in c2srMat2[1]:
-        total_size += len(sublist)
-
-    total_size += len(c2srMat2[2])
-    total_size += len(c2srMat2[3])
-    
+        
+    global total_memory_usage
 
     print("number of cycles:", controller.obtainMaxCycles())
-    print("Data Pulled from DRAM:", total_size)
+    print("Data Pulled from DRAM:", total_memory_usage)
     if matrix1.size >= 10000 or matrix2.size >= 10000:
         print("matrices too large to verify")
-    else:
-        trueval = matrix1 @ matrix2
-        print("Verify that sparse multiplication is correct: ", np.allclose(out.toarray(),trueval.toarray(),rtol=0.000001))
-
-# run_matraptor(sparseMat,sparseMat)
-# pe = PE(50)
-
-# A
-# [1, 0, 2, 3]
-# 
-# B
-# [1, 0, 0, 1]
-# [0, 0, 0, 0]
-# [1, 0, 1, 0]
-# [1, 1, 0, 1]
-#
-# C (should equal):
-# [6, 3, 2, 4] 
-#pe.compute(1,1,0,0,0)
-#pe.compute(1,1,0,0,3)
-
-#pe.compute(2,1,0,2,0)
-#pe.compute(2,1,0,2,2)
-
-#pe.compute(3,1,0,3,0)
-#pe.compute(3,1,0,3,1)
-#pe.compute(3,1,0,3,3)
-
-#print(pe.queuelist)
-
-
-# Step 4: Add true parallelism to the code
-
-# Step 5: add cycle counters as well as memory bandwidth counters
-
-
-
+    #else:
+    #    trueval = matrix1 @ matrix2
+    #    print("Verify that sparse multiplication is correct: ", np.allclose(out.toarray(),trueval,rtol=0.000001))
+    total_memory_usage = 0

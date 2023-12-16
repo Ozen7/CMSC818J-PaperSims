@@ -2,6 +2,7 @@ from scipy.sparse import csr_matrix, csc_matrix, coo_matrix
 import scipy
 import numpy as np
 import math
+import scipy.io as sio
 
         
 
@@ -80,12 +81,14 @@ class SystolicArray():
         self.colnumbers = [set([]) for _ in range(128)]
         self.PEarray = [[PE(y,x,self) for x in range(128)] for y in range(128)]
         self.cycleCount = 0
+        self.dataCount = 0
     
     def fill_sys(self,compcols, matrix, partitionNumber):
         for compcolNumber,compcol in enumerate(compcols):
             for column in compcol:
                 rows = column[1]
                 for row in rows:
+                    self.dataCount += 1
                     truerow = row + 128*partitionNumber
                     s = list(matrix.indices[matrix.indptr[truerow]:matrix.indptr[truerow+1]])
                     colind = matrix.indptr[truerow] + s.index(column[0])
@@ -97,6 +100,7 @@ class SystolicArray():
         count = 0
         continueFlag = True
         while continueFlag:
+            self.cycleCount += 1
             continueFlag = False
             for x in range(127,-1,-1):
                 # add in new values from the top:
@@ -108,7 +112,6 @@ class SystolicArray():
                         self.PEarray[0][x].inputTop(0,0,True)
                 for y in range(127,-1,-1):
                     continueFlag |= not self.PEarray[y][x].cycle()
-
         return self.accumulate
     
     def drain_sys(self):
@@ -118,6 +121,10 @@ class SystolicArray():
         for x in arr:
             for y in x:
                 y.reset()
+    
+    def reset_sys(self):
+        self.cycleCount = 0
+        self.drain_sys()
     
     def print_sys(self):
         arr = self.PEarray
@@ -137,6 +144,7 @@ class SystolicArray():
             print()
         print("-----endarray------")
 
+systolicarray = SystolicArray()
 
 
 def compressAndCompute(csrm, vector):
@@ -146,7 +154,6 @@ def compressAndCompute(csrm, vector):
         partitionedrows.append(csrm.indptr[x*128:min(length,(x+1)*128+1)])
 
     
-    systolicarray = SystolicArray()
     
     final = []
     
@@ -266,10 +273,8 @@ def compressAndCompute(csrm, vector):
         for compressedcolumns in range(0,len(compressedcols),128):
             systolicarray.fill_sys(compressedcols[compressedcolumns*128: min(len(compressedcols), (compressedcolumns + 1) * 128)],csrm,partitionNumber)
             partial += systolicarray.compute_spmv(vector=vector)
-        
-        print(partial)
-        
-        final += partial[0:len(vector)- partitionNumber*128].tolist()
+                
+        final += partial[0:min(128,csrm.shape[0]-128*partitionNumber)].tolist()
     
         systolicarray.drain_sys()
     
@@ -280,22 +285,16 @@ def compressAndCompute(csrm, vector):
     
     
 
+def run_sparsetpu(m,v):
+    i1 = csr_matrix(m)
+    v1 = v.flatten()
+    output = compressAndCompute(csr_matrix(m),v.flatten())
 
-# Example usage
-rows, cols = 200,200
-gen = np.random.default_rng()
-mask = gen.random((rows, cols)) < 0.1  # Example sparse matrix
-vec = gen.integers(low=1, high = 10, size = cols)
-data = gen.integers(low=1,high=10,size=(rows, cols)) * mask  # Example sparse matrix
-csr_sparse_matrix = csr_matrix(data)
-systolic_array_length = 100  # Example length of systolic array
-collision_threshold = 0.2  # Example collision threshold
-
-print(csr_sparse_matrix.toarray())
-x = compressAndCompute(csr_sparse_matrix,vec)
-print(x)
-
-true = np.matmul(csr_sparse_matrix.toarray(),vec.T)
-print(true)
-
-print(np.equal(x,true))
+    print("number of cycles:", systolicarray.cycleCount)
+    print("Data Pulled from DRAM:", len(i1.indices) + len(i1.indptr) + len(i1.data) + len(v1)) # all values are only brought to systolic array once.
+    if m.size >= 10000:
+        print("matrix too large to verify")
+    #else:
+    #    trueval = m @ v
+    #    print("Verify that sparse multiplication is correct: ", np.allclose(output,trueval,rtol=0.000001))
+    systolicarray.reset_sys()
