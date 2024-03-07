@@ -4,5 +4,6 @@
 /Simulators/Datasets
 /Simulators/__pycache__
 /Simulators/Support
+__pycache__
 .vscode/
 test.py
