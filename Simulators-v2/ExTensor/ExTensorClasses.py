@@ -43,6 +43,17 @@ def coo_to_csf(coo_matrix, llbxsize, llbysize, pexsize, peysize,swap):
 
     return root
 
+
+# Print the CSF representation (basic representation)
+def print_csf_tree(node, depth=0):
+    if node.value is not None:
+        print(f"{'  ' * depth}Leaf: {node.value}")
+    for coord, child in node.children.items():
+        print(f"{'  ' * depth}Coordinate {coord}:")
+        print_csf_tree(child, depth + 1)
+        
+        
+
 class DRAMIntersector: # NEEDS TESTING
     def __init__(self, skipto) -> None:
         self.streamOne = []
@@ -103,7 +114,8 @@ class DRAMIntersector: # NEEDS TESTING
 
 class LLBIntersector:
     def __init__(self) -> None:
-        self.i = None
+        self.nodeOne = None
+        self.nodeTwo = None
 
     def setNext(self,PEArray) -> None:
         self.PEArray = PEArray
@@ -111,9 +123,9 @@ class LLBIntersector:
     def inputBuffer(self, i):
         self.nexti = i
     
-    def load(s1: CSFNode|None, s2: CSFNode|None) -> None:
-        self.i = self.nexti
-        self.nexti = None
+    def load(self, s1: CSFNode|None, s2: CSFNode|None) -> None:
+        self.nodeOne = s1
+        self.nodeTwo = s2
     
     def cycle(self) -> None:
         if self.i == None:

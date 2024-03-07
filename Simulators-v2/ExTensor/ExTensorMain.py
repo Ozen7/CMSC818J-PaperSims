@@ -2,51 +2,9 @@ from ExTensorClasses import DRAMIntersector
 from ExTensorClasses import LLBIntersector
 from ExTensorClasses import PEArray
 from ExTensorClasses import PEIntersector
-
-class CSFNode:
-    def __init__(self, value):
-        self.value = value
-        self.children = {}
-        self.used = False
-    
-    def __str__(self) -> str:
-        print_csf_tree(self)
-        return "Root"
-
-def coo_to_csf(coo_matrix, llbxsize, llbysize, pexsize, peysize,swap):
-    root = CSFNode(None)
-
-    for i, j, data in zip(coo_matrix.row, coo_matrix.col, coo_matrix.data):
-        current_node = root
-        
-        a = i // llbxsize
-        b = j // llbysize
-        
-        c = (i - (a * llbxsize)) // pexsize
-        d = (j - (b * llbysize)) // pexsize
-        
-        
-        e = (i - (a * llbxsize) - (c * pexsize))
-        f = (j - (b * llbysize) - (d * peysize))
-        
-        if swap:
-            temp = e
-            e = f
-            f = temp
-
-        # Traverse the tree based on the coordinates
-        for coord in [a, b, c, d, e, f]:
-            if coord not in current_node.children:
-                current_node.children[coord] = CSFNode(None)
-            current_node = current_node.children[coord]
-
-        # Set the leaf node value to the data value
-        if current_node.value != None:
-            current_node.value += data
-        else:
-            current_node.value = data
-
-    return root
+from ExTensorClasses import CSFNode
+from ExTensorClasses import coo_to_csf
+from ExTensorClasses import print_csf_tree
 
 if __name__ == "__main__":
     endFlag = True
