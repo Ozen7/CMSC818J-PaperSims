@@ -11,8 +11,8 @@ from threading import Thread
 from threading import Event
 
 if __name__ == "__main__":
-    LLB_TILE_SIZE = 6
-    PE_TILE_SIZE = 2
+    LLB_TILE_SIZE = 10
+    PE_TILE_SIZE = 5
     
     endFlag = True
     dramIntersector = DRAMIntersector(True)
@@ -46,8 +46,8 @@ if __name__ == "__main__":
     #print("i2")
     #print_csf_tree(input2)
 
-    print(i1.toarray())
-    print(i2.toarray())
+    #print(i1.toarray())
+    #print(i2.toarray())
     dramIntersector.input(input1, input2)
     
     dIEvent = Event()
@@ -91,35 +91,21 @@ if __name__ == "__main__":
         for x in range(0,12):
             endFlag = endFlag or not peIntersectorList[x].endFlag
 
-
-        '''
-        print(endFlag)
-        endFlag = not llbIntersector.endFlag or endFlag
-        llbIntersector.load()
-        print(endFlag)
-        endFlag = not peArray.endFlag or endFlag
-        peArray.load()
-        print(endFlag)
-        for x in peIntersectorList:
-            endFlag = not x.endFlag or endFlag
-            x.load()
-            print(endFlag)
-        '''
-    r = []
-    c = []
-    v = []
-    for i,output in enumerate(peIntersectorList):
-        for o in output.output:
-            v.append(o[0])
-            r.append(o[1])
-            c.append(o[2])
+    #r = []
+    #c = []
+    #v = []
+    #for i,output in enumerate(peIntersectorList):
+    #    for o in output.output:
+    #        v.append(o[0])
+    #        r.append(o[1])
+    #        c.append(o[2])
     
-    est = coo_matrix((v,(r,c)),(100,100)).toarray()
-    actual = np.matmul(i1.toarray(),i2.toarray())
-    print(est)
-    print(actual)
-    print(np.equal(actual, est))
-    print(np.allclose(actual,est,0.0001,0.0001))
+    #est = coo_matrix((v,(r,c)),(10000,10000)).toarray()
+    #actual = np.matmul(i1.toarray(),i2.toarray())
+    #print(est)
+    #print(actual)
+    #print(np.equal(actual, est))
+    #print(np.allclose(actual,est,0.0001,0.0001))
     print(count)
         
         
