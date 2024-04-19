@@ -64,10 +64,14 @@ class DRAMIntersector:
         self.streamTwo = []
         self.nodeOne = None
         self.nodeTwo = None
+        self.nodeCounter = 0
         self.LLBIntersector = None
         self.skipto = skipto
         self.endFlag = False
         self.nodeTwoIndices = []
+        
+    def __str__(self) -> str:
+        return "DRAM" + " StreamOne: " + str(self.streamOne) + ", StreamTwo: " + str(self.streamTwo) + ", endFlag: " + str(self.endFlag)
     
     def running(self, event):
         while not self.endFlag:
@@ -300,6 +304,8 @@ class PEIntersector:
         self.llbTileSize = llbTileSize
         self.peTileSize = PETileSize
         self.id = num
+        self.numEmptyCycles = 0
+
     
     def load(self, input: tuple) -> None:
         # put the offsets for the coordinates here. The final coords can be added to this to get the x and y of the output.
@@ -327,6 +333,7 @@ class PEIntersector:
     
     def cycle(self) -> None:   
         if self.endFlag or not self.inputFlag:
+            self.numEmptyCycles += 1
             return
         
         # If one of the streams runs out, we reset node 1 (A) and iterate to the next child of node 2 (B) (output B stationary)
