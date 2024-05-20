@@ -528,30 +528,31 @@ class PEIntersector:
             self.streamTwo = sorted(list(self.nodeTwo.children[self.nodeTwoIndices[self.j-1]].children.keys()),reverse=True)
             # Note: Memory access makes use of pre-intersection fills, but all data is sent from the LLB intersector, so no DRAM access is necessary
             return
-        elif self.mode == "NoMerge" and self.k > self.kMax or not (self.nodeOne or self.nodeTwo) or self.k == -1:
-            if self.nodeOne and self.nodeTwo and self.j >= len(self.nodeTwo.children) and self.i < len(self.nodeOne.children):
-                self.i += 1
-                self.j = 0
-            elif not (self.nodeOne or self.nodeTwo) or self.j >= len(self.nodeTwo.children):
-                if not self.inputBuffer:
-                    self.inputFlag = False
+        elif self.mode == "NoMerge":
+            if self.k > self.kMax or not (self.nodeOne or self.nodeTwo) or self.k == -1:
+                if self.nodeOne and self.nodeTwo and self.j >= len(self.nodeTwo.children) and self.i < len(self.nodeOne.children):
+                    self.i += 1
+                    self.j = 0
+                elif not (self.nodeOne or self.nodeTwo) or self.j >= len(self.nodeTwo.children):
+                    if not self.inputBuffer:
+                        self.inputFlag = False
+                        return
+                    newNodes = self.inputBuffer.popleft()
+                    self.row, self.col  = self.inputCoordBuffer.popleft()
+                    if newNodes == (None,None):
+                        self.endFlag = True
+                        return
+                    # Normally, memory access would be done here! Both nodes are fully loaded along with their scalars. Its easier
+                    # to count below, though so thats what I do.
+                    self.nodeOne = newNodes[0]
+                    self.nodeTwo = newNodes[1]
+                    self.j = 0
+                    self.i = 1
+                    self.nodeOneIndices = sorted(list(self.nodeOne.children.keys()))
+                    self.nodeTwoIndices = sorted(list(self.nodeTwo.children.keys()))
                     return
-                newNodes = self.inputBuffer.popleft()
-                self.row, self.col  = self.inputCoordBuffer.popleft()
-                if newNodes == (None,None):
-                    self.endFlag = True
-                    return
-                # Normally, memory access would be done here! Both nodes are fully loaded along with their scalars. Its easier
-                # to count below, though so thats what I do.
-                self.nodeOne = newNodes[0]
-                self.nodeTwo = newNodes[1]
-                self.j = 0
-                self.i = 1
-                self.nodeOneIndices = sorted(list(self.nodeOne.children.keys()))
-                self.nodeTwoIndices = sorted(list(self.nodeTwo.children.keys()))
-                return
-            self.k = 0
-            self.j += 1
+                self.k = 0
+                self.j += 1
             
         
         if self.mode == "Skip":

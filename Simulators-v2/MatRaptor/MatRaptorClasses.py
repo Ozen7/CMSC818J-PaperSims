@@ -295,6 +295,29 @@ class SpBL:
     def loadMatrixB(self, BMatrix):
         self.B_values, self.B_column_ids, self.B_row_lengths, self.B_row_pointers = BMatrix
         
+        
+    def loadMemory(self,amount):
+        # The B matrix loader is definitely a bit worse off when it comes to streaming memory. 
+        # Remember that the B matrix is also in C2SR, meaning that its rows are also channel-specific. This loader works very similarly
+        # to the A matrix loader, but instead moves around into different channels by need instead of sticking to the same one 
+        # in between rows.
+        
+        
+        # 1) each row is isolated into an individual channel, but if multiple B matrix loaders have to access the same one, one has to wait
+        #    since bandwidth is limited to 16 gb/s, or 16 bytes per cycle, and is only sufficient to keep up with the streaming needs of a single
+        #    B matrix prefetcher.
+        # 2) When switching rows, a new row has to be pulled into the row buffer (Just like the A matrix loader)
+        
+        
+        # We can assume that channel interleaving size is 64 Bytes. This means that we request 64 bytes at a time from a specific channel, 
+        # and then get assigned a certain number of bytes each cycle by the memory loader to use! If our available bytes are 0,
+        # we don't do anything. Once we get to the end of a row, we move on to the next one and create a new set of requests
+        self.MemoryUsage += amount
+        if self.MemoryUsage % 8000 < amount:
+            self.memoryCycles += 70 # row latency is 70 cycles
+        if self.MemoryUsage % 64 < amount:
+            self.memoryCycles += 5 #column latency is 5 cycles
+        
     
     def cycle(self):
         if not self.inputFlag or self.endFlag:
@@ -336,6 +359,8 @@ class SpAL:
         self.i = ChannelNumber # start at 0, and add numChannels every time
         self.currentValueBuffer = None
         self.currentColumnBuffer = None
+        self.MemoryUsage = 0
+        self.memoryCycles = 0
         
     def setNext(self,b: "SpBL"):
         self.SpBL = b
@@ -345,10 +370,29 @@ class SpAL:
         self.currentValueBuffer = deque(self.A_values[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]]) # First set of values (one row of A)
         self.currentColumnBuffer = deque(self.A_column_ids[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]]) # First set of column numbes (one row of A)
     
+    
+    def loadMemory(self,amount):
+        # Inherently, due to the nature of how C2SR works, the only slowdowns we have here are row latency every 8 kilobytes, and column latency
+        # every 64 bytes. Bandwidth is 16 Gb/s for each channel (16 bytes/cycle), meaning that the accelerator only sends one coordinate/value pair each cycle.
+        self.MemoryUsage += amount
+        if self.MemoryUsage % 8000 < amount:
+            self.memoryCycles += 70 # row latency is 70 cycles
+        if self.MemoryUsage % 64 < amount:
+            self.memoryCycles += 5 #column latency is 5 cycles
+            
+        # send these memorycycles along with a self reference to an external class which keeps track of memory request and response queues,
+        # and sets a memoryFlag to False when it is finished loading everything it needs to. 
+        # We can assume that channel interleaving size is 64 Bytes. This means that we request 64 bytes at a time from a specific channel, 
+        # and then get assigned a certain number of bytes each cycle by the memory loader to use! If our available bytes are 0,
+        # we don't do anything. Once we get to the end of a row, we move on to the next one and create a new set of requests
+    
     def __str__(self) -> str:
         return "i: " + str(self.i) + ", ValueBuffer: " + str(self.currentValueBuffer) + ", ColumnBuffer: " + str(self.currentColumnBuffer)
     
     def cycle(self):
+        if self.memoryCycles > 0:
+            self.memoryCycles -= 1
+            return
         if self.endFlag:
             return
 
@@ -362,254 +406,9 @@ class SpAL:
             self.currentColumnBuffer = deque(self.A_column_ids[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]])
 
         else:
-            # this is in the else because a row could be empty!
-            #print("LEN OF COLUMN", self.C, len(self.currentColumnBuffer))
-            #print("LEN OF VALUE", self.C, len(self.currentValueBuffer))
+            # 16 bytes per cycle is streamed.
+            self.loadMemory(16)
             k = self.currentColumnBuffer.popleft()
             a = self.currentValueBuffer.popleft() 
             self.SpBL.input(a,self.i,k)
-
-"""
-# Example usage
-# data = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-# indices = [0, 2, 4, 1, 3, 4, 0, 2, 3]
-# indptr = [0, 2, 4, 7, 9]
-datacsr = csr_matrix(sparsematrix)
-data = datacsr.data
-indices = datacsr.indices
-indptr = datacsr.indptr
-
-num_channels = 3
-
-c2sr_values, c2sr_column_ids, c2sr_row_length, c2sr_row_pointer = csr_to_c2sr(data, indices, indptr, num_channels)
-
-# Print the results
-assert(len(c2sr_values) == len(c2sr_column_ids))
-
-print("C2SR Values:", c2sr_values)
-print("C2SR Column IDs:", c2sr_column_ids)
-print("C2SR Row Lengths:", c2sr_row_length)
-print("C2SR Row Pointers:", c2sr_row_pointer)
-
-
-# Step 2: Develop functionality of a single PE assigned to each row.
-
-class PE:
-    def __init__(self,queuesize,queuenum):
-        self.phase1Cycles = 0
-        self.phase2Cycles = 0
-        self.queuenum = queuenum
-        self.queuesize = queuesize
-        self.queuelist = [deque(maxlen=queuesize) for _ in range(0,queuenum)]
-        self.helperqueue = 0
-        self.nomerge = True
-        self.kprev = -1
-    
-    def getNumCycles(self):
-        return (self.phase1Cycles, self.phase2Cycles)
-    
-    def reset(self):
-        self.queuelist = [deque(maxlen=self.queuesize) for _ in range(0,self.queuenum)]
-        self.phase1Cycles = 0
-        self.phase2Cycles = 0
-        self.helperqueue = 0
-        self.nomerge = True
-        self.kprev = -1
-        
-    def merge(self,val,i,j):
-        if self.nomerge:
-            self.queuelist[self.currentqueue].append((val,j))
-        else:
-            while len(self.queuelist[self.currentqueue]) != 0 and self.queuelist[self.currentqueue][0][1] < j:
-                # loop through queue until we find a col value greater than or equal to that of our new input
-                self.queuelist[self.helperqueue].append(self.queuelist[self.currentqueue].popleft())
             
-            #If they're equal in column, add them up instead.
-            if len(self.queuelist[self.currentqueue]) != 0 and self.queuelist[self.currentqueue][0][1] == j:
-                self.queuelist[self.helperqueue].append((val + self.queuelist[self.currentqueue].popleft()[0],j))
-            else:
-                self.queuelist[self.helperqueue].append((val,j))
-                
-        
-    # the paper was confusing on whether it included K or not in its simulation.
-    def compute(self, a, b, i, k, j):
-        
-        # if there is no prior k value, or the prior k value is not the same as the current one 
-        # (we are operating on a new row in B)
-        if self.kprev != k:
-            # if we DID merge in the previous vector with another queue, we now flush the remaining values into the helper queue.
-            # the now-empty queue we merged into is now the helper queue
-            if not self.nomerge:
-                for _ in range(0,len(self.queuelist[self.currentqueue])):
-                    self.queuelist[self.helperqueue].append(self.queuelist[self.currentqueue].popleft())
-
-                
-                assert(len(self.queuelist[self.currentqueue]) == 0)
-                self.helperqueue = self.currentqueue
-                
-            self.kprev = k
-            
-            #This is not part of the original design, but its the only way I could figure out how to do it
-            adjustedqueues = self.queuelist[:self.helperqueue] + self.queuelist[self.helperqueue + 1:]
-            newqueueidx = adjustedqueues.index(min(adjustedqueues, key=len, default=None))
-            if newqueueidx >= self.helperqueue:
-                newqueueidx += 1
-            self.currentqueue = newqueueidx
-            
-            if len(self.queuelist[self.currentqueue]) == 0:
-                self.nomerge = True
-            else:
-                self.nomerge = False
-                
-        self.phase1Cycles += 1 # one cycle for each multiplication, the merging and accumulation is masked by another multiplication
-        c = a * b
-        self.merge(c,i,j)
-    
-    def accumulateandoutput(self):
-        data = []
-        indices = []
-        while True:
-            firstcols = np.zeros(self.queuenum)
-            for x in range(self.queuenum):
-                if self.queuelist[x]:
-                    firstcols[x] = self.queuelist[x][0][1]
-                else:
-                    firstcols[x] =  2**30
-            total = 0
-        
-            for x in firstcols:
-                if x != 2**30:
-                    break
-            else:
-                break
-            
-            # find minimum values across all queues and accumulate them. according to the paper, this ONLY takes one cycle. 
-            # "In the case when multiple queues have the same minimum column index at the top of the queue, all such queues are popped and
-            # the sum of popped elements is streamed to the main memory"
-            # Note that there is a dedicated portion that keeps track of the minimum column IDs as well as an adder tree, so this isn't too 
-            # far fetched, even if the addition should probably technically take more than one cycle.
-            self.phase2Cycles += 1
-            mins = np.where(firstcols == firstcols.min())[0]
-            indices.append(self.queuelist[mins[0]][0][1])
-
-            for num in mins:
-                total += self.queuelist[num].popleft()[0]
-            data.append(total)
-        return (data, indices)
-        
-            
-                
-        
-        
-# Step 3: Develop a way to load information in parallel to each PE, splitting based on row. 
-class Controller:
-    def __init__(self,A,B,numchannels,queuelengths,queuenum):
-        #Both of these are converted to C2SR format.
-        self.A_values, self.A_column_ids, self.A_row_lengths, self.A_row_pointers = csr_to_c2sr(A.data, A.indices,A.indptr,numchannels)
-        self.B_values, self.B_column_ids, self.B_row_lengths, self.B_row_pointers = csr_to_c2sr(B.data, B.indices,B.indptr,numchannels)
-
-        self.outputshape = (A.shape[0], B.shape[1])
-        
-        self.pes = [PE(queuesize=queuelengths,queuenum=queuenum) for _ in range(numchannels)]
-            
-        self.numchannels = numchannels
-        
-        self.peNumCycles = [[0,0] for _ in range(self.numchannels)]
-    
-    def obtainMaxCycles(self):
-        return max(map(lambda x : x[0] + x[1], self.peNumCycles))
-    
-    def compute(self):
-        global total_memory_usage
-        indices = []
-        indptr = []
-        data = []
-        channel = 0
-        finaladd = 0
-        for row in range(len(self.A_row_lengths)):
-            total_memory_usage += 2 # read from A: (length, row pointer)
-            channel = row % self.numchannels
-            PE = self.pes[channel]
-            rowstart = self.A_row_pointers[row][1]
-            
-            for a in range(self.A_row_lengths[row][1]):
-                total_memory_usage += 2 # read from A: (value, column id)
-                adata = self.A_values[channel][rowstart + a]
-                acol = self.A_column_ids[channel][rowstart + a]
-                (browchannel, browstart) = self.B_row_pointers[acol]
-                total_memory_usage += 2 # read from B: (length, row pointer)
-                
-                for b in range(self.B_row_lengths[acol][1]):
-                    total_memory_usage += 2 # read from B: (value, column id)
-                    bdata = self.B_values[browchannel][browstart + b]
-                    bcol = self.B_column_ids[browchannel][browstart + b]
-                    PE.compute(adata,bdata,row,acol,bcol)
-            (d, i) = PE.accumulateandoutput()
-            (phase1,phase2) = PE.getNumCycles()
-            self.peNumCycles[channel][0] += max(phase1,self.peNumCycles[channel][1])
-            self.peNumCycles[channel][1] = phase2
-            finaladd = phase2
-            PE.reset()
-            indptr.append(len(data))
-            indices += i
-            data += d
-        self.peNumCycles[channel][0] += finaladd
-        indptr.append(len(data))
-        
-        if indptr != []:
-            return csr_matrix((data,indices,indptr), shape=(self.outputshape))
-        else:
-            return 0
-            
-
-#A = [1,0,2,3]
-#B = [[1,0,0,1],[0,0,0,0],[1,0,1,0],[1,1,0,1]]
-#controller = Controller(csr_matrix(A),csr_matrix(B),2,50,3)
-
-gen = np.random.default_rng()
-data1 = gen.integers(0,10,5)
-row1 = gen.integers(0,5,5)
-col1 = gen.integers(0,5,5)
-
-data2 = gen.integers(0,10,5)
-row2 = gen.integers(0,5,5)
-col2 = gen.integers(0,5,5)
-i1 = coo_matrix((data1, (row1, col1)), shape=(5, 5))
-i2 = coo_matrix((data2, (row2, col2)), shape=(5, 5))
-
-'''
-sparseMat = sio.mmread('C:\Workspace\CMSC818J\PaperSims\CMSC818J-PaperSims\Simulators\Datasets\mbeacxc.mtx')
-controller = Controller(csr_matrix(sparseMat),csr_matrix(sparseMat),10,100000,100)
-
-out = controller.compute()
-
-
-print(out.toarray())
-print(np.matmul(sparseMat.toarray(),sparseMat.toarray()))
-#print(np.matmul(i1.toarray(),i2.toarray()))
-print(np.equal(out.toarray(), np.matmul(sparseMat.toarray(),sparseMat.toarray())))
-print(np.allclose(out.toarray(),np.matmul(sparseMat.toarray(),sparseMat.toarray()),rtol=0.000001))
-
-'''
-#controller = Controller(csr_matrix(i1),csr_matrix(i2),10,10,100)
-
-# input matrices are in CSR format
-def run_matraptor(matrix1,matrix2):
-    csr_m1 = csr_matrix(matrix1)
-    csr_m2 = csr_matrix(matrix2)
-
-    controller = Controller(csr_m1,csr_m2,10,100000,100)
-
-    out = controller.compute()
-        
-    global total_memory_usage
-
-    print("number of cycles:", controller.obtainMaxCycles())
-    print("Data Pulled from DRAM:", total_memory_usage)
-    if matrix1.size >= 10000 or matrix2.size >= 10000:
-        print("matrices too large to verify")
-    #else:
-    #    trueval = matrix1 @ matrix2
-    #    print("Verify that sparse multiplication is correct: ", np.allclose(out.toarray(),trueval,rtol=0.000001))
-    total_memory_usage = 0
-"""
