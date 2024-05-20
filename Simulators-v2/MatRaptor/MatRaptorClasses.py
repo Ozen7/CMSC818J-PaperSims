@@ -282,41 +282,26 @@ class SpBL:
         self.i = 0
         self.k = 0
         
+        self.memory = None
+        self.memoryWastedCycles = 0
+        self.MemoryUsage = 0
+        self.freeBytes = 0
+        
     def __str__(self) -> str:
         return "i: " + str(self.i) + ", k:" + str(self.k) + ", ValueBuffer: " + str(self.currentValueBuffer) + ", ColumnBuffer: " + str(self.currentColumnBuffer)
         
     def setNext(self,p: "PE"):
         self.PE = p
     
+    def setMemory(self,m: "Memory"):
+        self.memory = m
+
     def input(self, a, i, k):
         self.inputBuffer.append((a,i,k))
         self.inputFlag = True
         
     def loadMatrixB(self, BMatrix):
         self.B_values, self.B_column_ids, self.B_row_lengths, self.B_row_pointers = BMatrix
-        
-        
-    def loadMemory(self,amount):
-        # The B matrix loader is definitely a bit worse off when it comes to streaming memory. 
-        # Remember that the B matrix is also in C2SR, meaning that its rows are also channel-specific. This loader works very similarly
-        # to the A matrix loader, but instead moves around into different channels by need instead of sticking to the same one 
-        # in between rows.
-        
-        
-        # 1) each row is isolated into an individual channel, but if multiple B matrix loaders have to access the same one, one has to wait
-        #    since bandwidth is limited to 16 gb/s, or 16 bytes per cycle, and is only sufficient to keep up with the streaming needs of a single
-        #    B matrix prefetcher.
-        # 2) When switching rows, a new row has to be pulled into the row buffer (Just like the A matrix loader)
-        
-        
-        # We can assume that channel interleaving size is 64 Bytes. This means that we request 64 bytes at a time from a specific channel, 
-        # and then get assigned a certain number of bytes each cycle by the memory loader to use! If our available bytes are 0,
-        # we don't do anything. Once we get to the end of a row, we move on to the next one and create a new set of requests
-        self.MemoryUsage += amount
-        if self.MemoryUsage % 8000 < amount:
-            self.memoryCycles += 70 # row latency is 70 cycles
-        if self.MemoryUsage % 64 < amount:
-            self.memoryCycles += 5 #column latency is 5 cycles
         
     
     def cycle(self):
@@ -339,7 +324,19 @@ class SpBL:
             # Because we are loading from matrix B, We need to check where each row is (channel and location) using row lengths and pointers
             self.currentValueBuffer = deque(self.B_values[self.B_row_pointers[self.k][0]][self.B_row_pointers[self.k][1]:self.B_row_pointers[self.k][1] + self.B_row_lengths[self.k][1]])
             self.currentColumnBuffer = deque(self.B_column_ids[self.B_row_pointers[self.k][0]][self.B_row_pointers[self.k][1]:self.B_row_pointers[self.k][1] + self.B_row_lengths[self.k][1]])
+            
+            numBytes = len(self.currentColumnBuffer) * 4 + len(self.currentValueBuffer) * 4
+            # 128 bytes are requested in vector fashion (channel interleaving size = 128) - since we use C2SR, no data is wasted.
+            for x in range(0,numBytes//128+1):
+                ms = min(128,numBytes)
+                self.memory.requestData(self,self.B_row_pointers[self.k][0],ms)
+                self.MemoryUsage += ms
         else:
+            if self.freeBytes < 8:
+                self.memoryWastedCycles += 1
+                return
+            # 8 bytes for one set of column, value
+            self.freeBytes -= 8
             # in the else statement because if a row is empty we could pop from an empty queue (also fetching data should take at least one cycle to queue it lol)
             b = self.currentValueBuffer.popleft()
             j = self.currentColumnBuffer.popleft()
@@ -356,46 +353,36 @@ class SpAL:
         self.numChannels = numChannels
         self.A_values, self.A_column_ids, self.A_row_lengths, self.A_row_pointers = (None, None, None, None)
         self.SpBL = None
+        self.memory = None
         self.i = ChannelNumber # start at 0, and add numChannels every time
         self.currentValueBuffer = None
         self.currentColumnBuffer = None
+        self.memoryWastedCycles = 0
         self.MemoryUsage = 0
-        self.memoryCycles = 0
+        self.freeBytes = 0
         
     def setNext(self,b: "SpBL"):
         self.SpBL = b
+    
+    def setMemory(self,m: "Memory"):
+        self.memory = m
     
     def loadMatrixA(self, AMatrix):
         self.A_values, self.A_column_ids, self.A_row_lengths, self.A_row_pointers = AMatrix # Stored in C2SR format
         self.currentValueBuffer = deque(self.A_values[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]]) # First set of values (one row of A)
         self.currentColumnBuffer = deque(self.A_column_ids[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]]) # First set of column numbes (one row of A)
-    
-    
-    def loadMemory(self,amount):
-        # Inherently, due to the nature of how C2SR works, the only slowdowns we have here are row latency every 8 kilobytes, and column latency
-        # every 64 bytes. Bandwidth is 16 Gb/s for each channel (16 bytes/cycle), meaning that the accelerator only sends one coordinate/value pair each cycle.
-        self.MemoryUsage += amount
-        if self.MemoryUsage % 8000 < amount:
-            self.memoryCycles += 70 # row latency is 70 cycles
-        if self.MemoryUsage % 64 < amount:
-            self.memoryCycles += 5 #column latency is 5 cycles
-            
-        # send these memorycycles along with a self reference to an external class which keeps track of memory request and response queues,
-        # and sets a memoryFlag to False when it is finished loading everything it needs to. 
-        # We can assume that channel interleaving size is 64 Bytes. This means that we request 64 bytes at a time from a specific channel, 
-        # and then get assigned a certain number of bytes each cycle by the memory loader to use! If our available bytes are 0,
-        # we don't do anything. Once we get to the end of a row, we move on to the next one and create a new set of requests
+        numBytes = len(self.currentColumnBuffer)*4 + len(self.currentValueBuffer)*4 # 32-bit values and column numbers
+        self.memory.requestData(self,self.C,numBytes)
+        self.MemoryUsage += numBytes
     
     def __str__(self) -> str:
         return "i: " + str(self.i) + ", ValueBuffer: " + str(self.currentValueBuffer) + ", ColumnBuffer: " + str(self.currentColumnBuffer)
     
     def cycle(self):
-        if self.memoryCycles > 0:
-            self.memoryCycles -= 1
-            return
+
         if self.endFlag:
             return
-
+        
         if not self.currentValueBuffer:
             self.i += self.numChannels
             if self.i >= len(self.A_row_pointers):
@@ -404,11 +391,40 @@ class SpAL:
                 return
             self.currentValueBuffer = deque(self.A_values[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]])
             self.currentColumnBuffer = deque(self.A_column_ids[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]])
-
+            numBytes = len(self.currentColumnBuffer)*4 + len(self.currentValueBuffer)*4 # 32-bit values and column numbers
+            for x in range(0,numBytes//128+1):
+                ms = min(128,numBytes)
+                self.memory.requestData(self,self.A_row_pointers[self.i][0],ms)
+                self.MemoryUsage += ms
+                numBytes -= 128
         else:
-            # 16 bytes per cycle is streamed.
-            self.loadMemory(16)
+            if self.freeBytes < 8:
+                self.memoryWastedCycles += 1
+                return
+            # 8 bytes for one set of column, value
+            self.freeBytes -= 8
             k = self.currentColumnBuffer.popleft()
             a = self.currentValueBuffer.popleft() 
             self.SpBL.input(a,self.i,k)
             
+class Memory:
+    def __init__(self, numChannels) -> None:
+        self.numChannels = numChannels
+        self.channelQueues = [deque() for _ in range(numChannels)]
+        self.channelCurrent = [[[None,0,0],[None,0,0]] for _ in range(numChannels)]
+    
+    def requestData(self,loader, channel, amount):
+        # numCycles includes the row and column latencies
+        self.channelQueues[channel].append([loader,amount,10]) # (loader, number of bytes, memory latency)
+    
+    def cycle(self):
+        for i,channel in enumerate(self.channelCurrent):
+            for x,request in enumerate(channel):
+                if request[2] <= 0 and request[1] > 0:
+                    request[0].freeBytes += 8 # "send" the bytes over to the PE. Each request has 8 bytes per cycle sent
+                    request[1] -= 8
+                elif request[2] > 0:
+                    request[2] -= 1
+                elif request[1] <= 0 and self.channelQueues[i]:
+                    self.channelCurrent[i][x] = self.channelQueues[i].popleft()
+
