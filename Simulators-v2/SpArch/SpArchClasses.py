@@ -2,22 +2,24 @@ import numpy as np
 from scipy.sparse import csr_matrix, coo_matrix
 from collections import deque
 import math
-import sys
-
+import time
+gen = np.random.default_rng()
 
 
 class Scheduler:
     # The scheduler is where the Huffman Tree is located. When the MergeTree finishes its merging, it calculates the next set of partial matrices to merge
     # it then goes to the PartialMatrixFetcher to pull any partial matrices that are small enough into the mergeTree, and to the MatrixAFetcher to pull 
     # a set of compressed columns (each of which becomes a partial matrix to be sent to the MergeTree). 
-    def __init__(self, MAF: "MatrixAFetcher", MT:"MergeTree", DLB: "DistanceListBuilder", MBP: "MatrixBPrefetcher") -> None:
+    def __init__(self, MAF: "MatrixAFetcher", MT:"MergeTree", DLB: "DistanceListBuilder", MBP: "MatrixBPrefetcher", MA: "MultiplierArray", numMergers) -> None:
         self.MatrixAFetcher = MAF
         self.MergeTree = MT
         self.DistanceListBuilder = DLB
         self.MatrixBPrefetcher = MBP
+        self.MultiplierArray = MA
         self.MatrixARows = MAF.rowLengths.copy()
         self.StoredMatrices = []
-        self.maxSchedule = ((len(self.MatrixARows)-2) % (64-1)) + 2
+        self.maxSchedule = ((len(self.MatrixARows)-2) % (numMergers-1)) + 2
+        self.numMergers = numMergers
         self.merging = False
 
     def addMatrix(self,num,size):
@@ -50,8 +52,7 @@ class Scheduler:
             self.StoredMatrices.pop()
             c += 1
         
-        print(self.StoredMatrices)
-        self.maxSchedule = 64
+        self.maxSchedule = self.numMergers
         self.MatrixAFetcher.inputInstructions(numACols)
         self.MergeTree.inputPartials(numACols,matrices,PMlength)
         self.merging = False
@@ -61,6 +62,10 @@ class Scheduler:
     def checkEOF(self):
         # print(self.merging, self.MatrixAFetcher.inputFlag, self.DistanceListBuilder.lookaheadFIFO, self.MatrixBPrefetcher.inputFlag)
         # if not merging, and no input remaining:
+        if self.MatrixAFetcher.endFlag and not self.merging and not self.DistanceListBuilder.lookaheadFIFO and not self.MatrixBPrefetcher.inputFlag:
+            self.MatrixBPrefetcher.endFlag = True
+            self.MergeTree.endFlag = True
+            self.MultiplierArray.endFlag = True
         if not self.merging and not self.MatrixAFetcher.inputFlag and not self.DistanceListBuilder.lookaheadFIFO and not self.MatrixBPrefetcher.inputFlag:
             self.merging = True
             # indicates to the merge Tree that it should begin merging
@@ -69,6 +74,26 @@ class Scheduler:
         
         
         
+
+class Memory:
+    def __init__(self, numChannels, peakBandwidthPerChannel) -> None:
+        self.numChannels = numChannels
+        self.channelQueues = [deque() for _ in range(numChannels)]
+        self.channelCurrent = [(None,0,0) for _ in range(numChannels)]
+        self.BPC = peakBandwidthPerChannel
+    
+    def requestData(self,loader, channel, amount):
+        # numCycles includes the row and column latencies
+        self.channelQueues[channel].append([loader,amount]) # (loader, number of bytes, memory latency)
+    
+    def cycle(self):
+        for i,channel in enumerate(self.channelCurrent):
+            if channel[1] > 0:
+                sent = min(channel[1],self.BPC)
+                channel[0].freeBytes += sent # "send" the bytes over to the PE.
+                channel[1] -= sent
+            elif channel[1] <= 0 and self.channelQueues[i]:
+                self.channelCurrent[i] = self.channelQueues[i].popleft()
             
         
         
@@ -93,22 +118,36 @@ class MatrixAFetcher:
         self.endFlag = False
         self.inputFlag = False
         self.distanceListBuilder = None
+        self.colLengths = []
         self.rowLengths = []
+        self.memory = None
+
         
-        # preprocessing to make sure that we have a list of the number of values in each compressed column - important for the huffman tree scheduler
+        # processing to make sure that we have a list of the number of values in each compressed column - important for the huffman tree scheduler
+        # while doing this, we also create a list of nonzero row lengths to be used when iterating through them to find A values to send.
         for x in range(len(A.indptr)-1):
+            # If the paper had mentioned that this sort of processing was done beforehand, it would be fine
+            # my only issue is that they didn't mention it, even if it was necessary
             l = A.indptr[x+1] - A.indptr[x]
-            if len(self.rowLengths) < l:
-                self.rowLengths += ([0] * (l - len(self.rowLengths)))
+            self.rowLengths.append(l)
+            if len(self.colLengths) < l:
+                self.colLengths += ([0] * (l - len(self.colLengths)))
             for y in range(l):
-                self.rowLengths[y] += 1
+                self.colLengths[y] += 1
         # The currentCondensedColumn should be equal to the furthest condensed column at first
-        self.currentCondensedColumn = len(self.rowLengths)
+        self.currentCondensedColumn = len(self.colLengths)
         self.currentNumColumns = 0
         self.currentRow = 0
+        
+        self.memoryUse = 0
+        self.memoryQueue = deque([])
+        self.freeBytes = 0
 
     def setDLB(self,DLB):
         self.distanceListBuilder = DLB
+    
+    def setMemory(self,Memory):
+        self.memory = Memory
     
     def inputInstructions(self,numColumns):
         if self.currentCondensedColumn == 0:
@@ -122,35 +161,54 @@ class MatrixAFetcher:
         if self.currentCondensedColumn < 0:
             self.currentNumColumns += self.currentCondensedColumn
             self.currentCondensedColumn = 0
+            
+        # The paper simply states that the matrix A fetcher "calculates addresses of data in the selected columns", and not how it is 
+        # done.
 
         # Make use of current condensed column number, and set currentCondensedColumn (the minimum number of columns needed in a row to have values we want for this round)
         # currentNumColumns allows us to specify the range of columns we want to pull from memory (condensed columns [currendCondensedColumns:currentCondensedColumns + currentNumColumns])
         # This number is specified by the huffman tree builder, making use of the number of values in each column within a minheap
     
+    def running(self, event):
+        while not self.endFlag:
+            time.sleep(0.0001)  
+            if not event.isSet():
+                self.cycle()
+                event.set()
+        event.set()
+    
     def cycle(self):
-        #Every cycle, if we arent at EOF:
-        # 1) Look through a row, check if it has have columns within the condensed column.
-        # 2) If it does, load them into the FIFO and increment
-        # 3) If it doesn't, increment.
+        # Note: MatrixAFetcher does not wait for values to be fetched, and keeps making requests
+        while self.freeBytes >= 8:
+            self.distanceListBuilder.input(self.memoryQueue.popleft()) # data, row, column, condensed column number are sent to DLB buffer. 
+            self.freeBytes -= 8
+
         if self.endFlag or not self.inputFlag:
             return
         
-        if self.currentRow >= len(self.A.indptr) -1:
+        # Every cycle, if we arent at EOF:
+        # 1) Look through a row, check if it has have columns within the condensed column.
+        # 2) If it does, load them into the FIFO and increment
+        # 3) If it doesn't, increment.
+        if self.currentRow >= len(self.A.indptr) -1 and not self.memoryQueue:
             # We have gone through all the rows, and all valid A values are sent. Send none so that the Multiplier can signal that loading is finished to the MergeTree
             self.inputFlag = False
             return
+        elif self.currentRow >= len(self.A.indptr) -1:
+            return
         
-        if self.A.indptr[self.currentRow+1] - self.A.indptr[self.currentRow] > self.currentCondensedColumn:
+        if self.rowLengths[self.currentRow] > self.currentCondensedColumn:
             i = self.A.indptr[self.currentRow] + self.currentCondensedColumn
-            #print(self.A.indptr[self.currentRow+1] - self.A.indptr[self.currentRow] - self.currentCondensedColumn)
-            if self.A.indptr[self.currentRow+1] - self.A.indptr[self.currentRow] - self.currentCondensedColumn < self.currentNumColumns: 
+            if self.rowLengths[self.currentRow] - self.currentCondensedColumn < self.currentNumColumns: 
                 end = self.A.indptr[self.currentRow+1]
             else:
                 end = self.currentNumColumns + self.A.indptr[self.currentRow] + self.currentCondensedColumn
-            #print(i, end)
             for x in range(i,end):
-                #print(i,x,x-i)
-                self.distanceListBuilder.input((self.A.data[x],self.currentRow,self.A.indices[x],x-i)) # data, row, column, condensed column number are sent to DLB buffer. 
+                self.memoryUse += 4 * 2 # each int is 32 bits (or 4 bytes), and there are 2 of them to fetch (data & col). 8 bytes are fetched
+                # from a random channel. To simplify things, we assume that every 8 bytes fetched correspond
+                # to a set of data to be sent to the Distance List Builder, and send a value every 8 bytes that are fetched from memory.
+                self.memory.requestData(self,gen.integers(0,15),8)
+                self.memoryQueue.append((self.A.data[x],self.currentRow,self.A.indices[x],x-i)) # data has to be sent in order
         self.currentRow += 1
     
     
@@ -178,35 +236,11 @@ class DistanceListBuilder:
         
     def sendInput(self):
         self.Multiplier.loadAvalue(self.lookaheadFIFO.popleft())
-
-    def cycle(self):
-        # This part of the accelerator really doesn't need a cycle-by-cycle thing, it just sends data to the matrix B prefetcher and 
-        # multiplier array when asked. No point in modeling something that doesn't change anything
-        pass
         
     
 class MatrixBPrefetcher:
-    # Data is sent to multiplier in chunks of 16 per cycle, once a row is sent, the new A-value is sent to the multiplier, kicking out the old one.
-    # Then, the matrixBPrefetcher sends the values for the new row to the multiplier
-    
-    
-    # An important note about this part of the accelerator is that the 16 data fetchers work in parallel, and they work to load new buffer lines as the preloader sends data to the 
-    # multiplier array every cycle
-    
-    # Note: 
-    # Option 1) when it says multiple fetchers, does it mean that individual rows are fetched in parallel, hiding the latency for each row?
-    # Option 2) Maybe, instead of accessing the DRAM in parallel to load multiple rows at once, it loads in each row individually, and moves onto the next one before the first one is done multiplying
-    # This way, there is only one "fetcher", but it loads in parallel?
-    # Option 3) Each time the prefetcher is done sending a row to the multiplier, the buffer is "reformatted", and each fetcher is assigned a unique row to start/continue loading in
-    # This seems needlessly complicated, and is not necessarily indicative of what is shown in Figure 9. 
-    
-    # As it stands, in Figure 9, no "prefetching" is going on. At every time step when a value is needed, it is brought in from memory
-    
-    
-    
     
     """
-    Alright nebil - here's the plan:
     PrefetchBufferHash contains the parts of each row that is contained in the buffer.
     Basically, the 16 fetchers only serve to load a max of 16 parts of a row at a time
     We only move one row ahead, meaning that while one row is being fed into the multiplier, we're loading the next one in
@@ -237,11 +271,11 @@ class MatrixBPrefetcher:
         self.timeStep = 0
         self.endFlag = False
         self.inputFlag = False
-        self.memoryFlag = True
         self.distanceFIFO = deque([])
         self.prefetchBufferHash = {-1: 1024} # initially, every single set in the row is empty (assigned to -1), there are 1024 lines
         self.rowDistanceHash = {-1: deque([0])} # a queue of row distances in order assigned to this row
         self.multiplierArray = None
+        self.memory = None
         
         
         self.currentRowPointer = 0 # Used for row that is being sent to multiplier 
@@ -259,10 +293,18 @@ class MatrixBPrefetcher:
         self.nextRowIndices = [] # The next row's column indices
         
         self.memoryWastedCycles = 0
-        self.memLatency = 0
         self.memoryAccessBytes = 0
+        self.freeBytes = 0
+        self.rowsToFetch = 0
 
-
+    def running(self, event):
+        while not self.endFlag:
+            time.sleep(0.0001)  
+            if not event.isSet():
+                self.cycle()
+                event.set()
+        event.set()
+    
     def takeTimeStep(self):
         # set this true, if we see that there is input in the future, we set it back to false
         self.inputFlag = False
@@ -316,6 +358,9 @@ class MatrixBPrefetcher:
     
     def setDistanceListBuilder(self,DLB:"DistanceListBuilder"):
         self.DistanceListBuilder = DLB
+    
+    def setMemory(self, M: "Memory"):
+        self.memory = M
         
         
     def memoryAccess(self, numRows):
@@ -326,16 +371,25 @@ class MatrixBPrefetcher:
         self.memoryAccessBytes += numRows * 48 * 12 
         
         # The number of rows that need to be fetched by each fetcher:
-        numRowsFetched = math.ceil(numRows/16)
-        self.memLatency = 70 + 5 + math.ceil((numRowsFetched * 48 * 12)/128) # Memory Row latency of 70 cycles, Column latency of 5 cycles + 128 bytes/cycle, given 128gb/s and 1GhZ clock speed
-        self.memoryFlag = True
+        # we assume a "perfect split" 
+        numRowsPerFetcher = numRows//16
+        additional = numRows%16
+        for x in range(16):
+            if additional > x:
+                self.memory.requestData(self,x,(numRowsPerFetcher + 1)*48)
+            else:
+                self.memory.requestData(self,x,numRowsPerFetcher*48)
+        self.rowsToFetch = numRows # when this hits 0, the B prefetcher is done loading all data
     
     def cycle(self):
         if self.endFlag or not self.inputFlag:
             return
         
         if self.currentRowSendingFinished and self.nextRowLoadingFinished:
-            self.takeTimeStep()
+            self.takeTimeStep()    
+        elif self.currentRowSendingFinished and not self.nextRowLoadingFinished:
+            self.memoryWastedCycles += 1
+        
 
         # This is the part where we load a set of values into the multiplier array. Values are loaded 16 at a time
         # if our row pointer has exceeded the current length of the data, we don't do anything
@@ -351,7 +405,7 @@ class MatrixBPrefetcher:
     
         # This is the part where we load a row into buffer
         # MemoryFlag is false when prefetcher is waiting for memory, and true when it isnt
-        if not self.nextRowLoadingFinished and not self.memoryFlag:                
+        if not self.nextRowLoadingFinished and self.rowsToFetch <= 0:                
             if self.nextRowPointer >= len(self.nextRowData):
                 self.nextRowLoadingFinished = True
                 return
@@ -399,16 +453,18 @@ class MatrixBPrefetcher:
                         maximum = key
                 
                 self.furthestRowInPrefetcher = maximum
-        elif self.memoryFlag:
-            self.memoryWastedCycles += 1
-            self.memLatency -= 1
-            if self.memLatency <= 0:
-                self.memoryFlag = False
+        elif self.rowsToFetch > 0:
+            # reduce the number of rows to fetch by one for every 48 bytes that get fetched
+            # since we don't use the bytes until the entire row is fetched, the order doesn't really matter anyway
+            while self.freeBytes >= 48:
+                self.rowsToFetch -= 1
+                self.freeBytes -= 48
             return
                                
 
 class MultiplierArray:
     def __init__(self) -> None:
+        self.endFlag = False
         self.Avalue = 0
         self.AcompressedColumn = 0
         self.ARow = 0
@@ -424,7 +480,14 @@ class MultiplierArray:
         # we don't need the original column of A, but we do need a set of columns for B
         self.Temp_Bcols = []
         self.Temp_Brow = []
-        
+
+    def running(self, event):
+        while not self.endFlag:
+            time.sleep(0.0001)  
+            if not event.isSet():
+                self.cycle()
+                event.set()
+        event.set()
     
     # This runs every cycle that multiplication happens    
     def loadBrow(self,Brow,Bcols):
@@ -461,7 +524,7 @@ class MultiplierArray:
     
     def cycle(self):
         # this acts as the "input flag" that we have on other parts
-        if self.scheduler.merging:
+        if self.scheduler.merging or self.endFlag:
             return
 
         if self.Brow:
@@ -486,8 +549,9 @@ class MergeTree:
     # number achievable so that a merger does not get underutilized and be unable to keep up with the throughput of the overall tree
     # 2) a merger cannot react to values pulled in the same cycle. It needs to wait for the next cycle to fill up the values taken out
     # by its upper level merger in the previous cycle.
-    def __init__(self) -> None:
+    def __init__(self, mergeSize) -> None:
         self.merging = False
+        self.mergeSize = mergeSize
         self.loaded = [True] + [False] * 6
         self.inputFifos = [[deque([]),False] for x in range(64)]
         self.L1 = [[deque([]),True] for _ in range(32)]
@@ -500,6 +564,7 @@ class MergeTree:
         self.out = []
         self.scheduler = None
         self.totalCount = 0
+        self.endFlag = False
         
         # The partial matrix storage is also implemented in this class. Yes, it isn't like that in the actual paper, but
         # it doesn't really need its own class since the only thing it interacts with is the Merge Tree anyway
@@ -532,20 +597,34 @@ class MergeTree:
         
     def inputPartials(self, num, matrices, newMatrixSize):
         self.loadingPartials = True
-        self.memoryLatency = 0 #this is where the memory latency calculations would be done,
+        self.memoryLatency = 0
+        for x in matrices:
+            self.memoryLatency += 0
         self.totalCount = newMatrixSize
-        print(matrices)        
+        print(len(matrices))        
         for i,x in enumerate(matrices):
             self.inputFifos[i + num][0].extend(self.partialMatrices[x])
+
+    def running(self, event):
+        while not self.endFlag:
+            time.sleep(0.0001)  
+            if not event.isSet():
+                self.cycle()
+                event.set()
+        event.set()
     
     def cycle(self):
+        if self.endFlag:
+            return
         if self.loadingPartials:
             if self.memoryLatency <= 0:
                 self.loadingPartials = False
             else:
+                self.memoryLatency -= 128
                 return
         if not self.merging:
             return
+
         
         # first, we choose which queue we will fill up in each row
         chosenQueues = []
@@ -555,7 +634,7 @@ class MergeTree:
             if not self.loaded[i]:
                 newVal = True
                 for queue in self.fifos[i]:
-                    if len(queue[0]) < 16 and queue[1]:
+                    if len(queue[0]) < self.mergeSize and queue[1]:
                         newVal = False
                         break
                 self.loaded[i] = newVal
@@ -567,7 +646,7 @@ class MergeTree:
                     
                     # conditions: length of queue is shorter than current lowest, the queue has not "dried up", 
                     # and its two lower values are either dried up or have more than 16 values inside them.
-                    if len(queue[0]) < minimum and queue[1] and (len(self.fifos[i-1][num*2][0]) > 16 or not self.fifos[i-1][num*2][1]) and (len(self.fifos[i-1][num*2 + 1][0]) > 16 or not self.fifos[i-1][num*2 + 1][1]):
+                    if len(queue[0]) < minimum and queue[1] and (len(self.fifos[i-1][num*2][0]) > self.mergeSize or not self.fifos[i-1][num*2][1]) and (len(self.fifos[i-1][num*2 + 1][0]) > self.mergeSize or not self.fifos[i-1][num*2 + 1][1]):
                         minimum = len(queue)
                         queueToFill = num
                 chosenQueues.append(queueToFill) # the queue we will be filling using the ith comparator array is queueToFill
@@ -594,7 +673,7 @@ class MergeTree:
                 values2 = self.fifos[i][q*2 + 1][0]
                 count = 0
             
-                while values1 and values2 and count < 16:
+                while values1 and values2 and count < self.mergeSize:
                     c1 = values1[0]
                     c2 = values2[0]
                     if c1[1] < c2[1]: # if the row value of 1 is greater
@@ -612,10 +691,10 @@ class MergeTree:
                     count += 1
                 
                 # in case one row ran out (meaning all previous fifos under it are also empty!)
-                while values1 and count < 16:
+                while values1 and count < self.mergeSize:
                     self.fifos[i+1][q][0].append(values1.popleft())
                     count += 1
-                while values2 and count < 16:
+                while values2 and count < self.mergeSize:
                     self.fifos[i+1][q][0].append(values2.popleft())
                     count += 1
                 
@@ -627,8 +706,8 @@ class MergeTree:
                 if not self.fifos[i][q*2][0] and not self.fifos[i][q*2 + 1][0] and not self.fifos[i][q*2][1] and not self.fifos[i][q*2 + 1][1]:
                     self.fifos[i+1][q][1] = False
 
-        if len(self.fifos[-1][0][0]) >= 16 or not self.fifos[-1][0][1]:
-            for x in range(min(16,len(self.fifos[-1][0][0]))):
+        if len(self.fifos[-1][0][0]) >= self.mergeSize or not self.fifos[-1][0][1]:
+            for x in range(min(self.mergeSize,len(self.fifos[-1][0][0]))):
                 self.out.append(self.fifos[-1][0][0].popleft()) # pop 16 values out of the root fifo if possible.
         if not self.fifos[-1][0][1] and not self.fifos[-1][0][0]: # End of merging
             self.merging = False
@@ -636,254 +715,3 @@ class MergeTree:
             self.reset()
             self.scheduler.addMatrix(len(self.partialMatrices)-1,self.totalCount) # store new matrix in scheduler
             self.scheduler.schedule()
-        
-
-"""
-import numpy as np
-from scipy.sparse import csr_matrix, coo_matrix
-from collections import deque
-import math
-
-global total_memory_usage
-global truepartial
-
-truepartial = []
-
-total_memory_usage = 0
-
-#Matrix Condensing
-class Afetcher:
-    def __init__(self, A) -> None:
-        global total_memory_usage 
-
-        self.condenseSize = 63
-        self.A = csr_matrix(A)
-        data = self.A.data
-        indices = self.A.indices
-        self.originalcols = np.copy(self.A.indices)
-        indptr = self.A.indptr
-        
-        
-        # the entire A matrix is fetched from memory column by column. I can just calculate how much data is pulled all at once.
-        total_memory_usage += len(data) + len(indptr) + len(indices)
-
-        
-        # rearrange the order of the indices so that it is in increasing sorted order. Might be unnecessary but it will break otherwise
-        for i in range(0,len(indptr)-1):
-            data[indptr[i]:indptr[i+1]] = data[indptr[i] + np.argsort(indices[indptr[i]:indptr[i+1]])]
-            self.originalcols[indptr[i]:indptr[i+1]] = self.originalcols[indptr[i] + np.argsort(indices[indptr[i]:indptr[i+1]])]
-            indices[indptr[i]:indptr[i+1]] = np.arange(0,indptr[i+1]-indptr[i])
-        
-        self.A = csr_matrix((data,indices,indptr))
-        self.colPointer = self.A.shape[1]        
-        self.rowPointer = 1
-    
-    def __str__(self) -> str:
-        return str(self.A.toarray()) + "\n column pointer at: " + str(self.colPointer)
-    
-
-    def resetRows(self):
-        self.rowPointer = 1
-        self.colPointer -= self.condenseSize
-    
-    #returns a set of values that are in the same row of the current compressed column.
-    def nextRowSet(self):
-        
-        if self.rowPointer > self.A.shape[0]:
-            return None
-            
-        minval = 0 if self.colPointer - self.condenseSize <= 0 else self.colPointer-self.condenseSize
-        rp0 = self.A.indptr[self.rowPointer-1]
-        rp1 = self.A.indptr[self.rowPointer]
-
-        mask = np.in1d(self.A.indices[rp0: rp1],np.arange(minval, self.colPointer))
-        
-        while not mask.any() and self.colPointer > 0:
-            if self.rowPointer >= self.A.shape[0]:
-                return None
-            else:
-                self.rowPointer += 1
-            if self.colPointer < 0:
-                return None
-            
-            minval = 0 if self.colPointer - self.condenseSize <= 0 else self.colPointer-self.condenseSize
-
-                
-            rp0 = self.A.indptr[self.rowPointer-1]
-            rp1 = self.A.indptr[self.rowPointer]
-            mask = np.in1d(self.A.indices[rp0: rp1],np.arange(minval, self.colPointer))
-        
-        compressedcols = list(map(lambda x: x%self.condenseSize, self.A.indices[rp0:rp1][mask]))
-        retval = [self.rowPointer-1, compressedcols,  self.originalcols[rp0:rp1][mask],self.A.data[rp0:rp1][mask]]
-        
-        self.rowPointer += 1
-        return retval
-
-# Row Prefetcher
-class Bprefetcher:
-    def __init__(self,B) -> None:
-        self.B = csr_matrix(B)
-    def fetch(self, row):
-        # Note: I tried to implement the B prefetcher, but it got way too complex so i decided to just abstract it out.
-        # Since the row prefetcher was stated to achieve a 62% hit rate, I'm just going to count the amount of data pulled from memory and then 
-        # multiply it by 0.38 to save some headache.
-        global total_memory_usage
-  
-        begin = self.B.indptr[row]
-        end = self.B.indptr[row+1]
-        data = [self.B.data[begin:end],self.B.indices[begin:end]]
-        total_memory_usage += math.ceil(len(data) * 0.38)
-        return data
-
-
-class Merger:
-    def __init__(self, fifolist,nextMerger) -> None:
-        self.fifolist = fifolist
-        self.nextMerger = nextMerger
-    def __bool__(self):
-        for x in self.fifolist:
-            if bool(x):
-                return True
-        return False
-
-    def __str__(self) -> str:
-        ret = ""
-        for x in self.fifolist:
-            if bool(x):
-                ret += str(x)        
-        return ret
-        
-    def MergeAndPush(self, ind):
-        if self.nextMerger == None:
-            global truepartial
-            truepartial += list(self.fifolist[0])
-            self.fifolist[0] = deque()
-            return
-    
-        i1 = self.fifolist[ind * 2]
-        i2 = self.fifolist[ind * 2 + 1]
-        c1 = 0
-        c2 = 0
-        while bool(i1) and bool(i2) and c1 < 16 and c2 < 16:
-            if i1[0][0] < i2[0][0]:
-                self.nextMerger.fifolist[ind].append(i1.popleft())
-                c1 += 1
-            elif i1[0][0] > i2[0][0]:
-                self.nextMerger.fifolist[ind].append(i2.popleft())
-                c2 += 1
-            elif i1[0][1] < i2[0][1]:
-                self.nextMerger.fifolist[ind].append(i1.popleft())
-                c1 += 1
-            elif i1[0][1] > i2[0][1]:
-                self.nextMerger.fifolist[ind].append(i2.popleft())
-                c2 += 1
-            else:
-        
-                self.nextMerger.fifolist[ind].append([i1[0][0],i1[0][1],i1.popleft()[2] + i2.popleft()[2]])
-                c1 += 1
-                c2 += 1
-        if c1 == 16 or not bool(i1):
-            while bool(i2) and c2 < 16:
-                self.nextMerger.fifolist[ind].append(i2.popleft())
-                c2 += 1
-        elif c2 == 16 or not bool(i2):
-            while bool(i1) and c1 < 16:
-                self.nextMerger.fifolist[ind].append(i1.popleft())
-                c1 += 1
-        
-            
-
-
-class MultiplyAndMerge:
-    def __init__(self, A, B) -> None:
-        global truepartial
-        self.aFetcher = Afetcher(A)
-        self.bPrefetcher = Bprefetcher(B)
-        self.partials = [deque() for _ in range(64)]
-        for x in truepartial:
-            self.partials[63].append(x)
-        self.endflag = False
-        self.numcycles = 0
-        
-    def MultiplyColumn(self):
-        rs = self.aFetcher.nextRowSet()
-        while rs != None:
-            for x in range(len(rs[3])):
-                brow = np.array(self.bPrefetcher.fetch(rs[2][x]))
-                datapoints = brow[0] * rs[3][x]
-                self.numcycles += len(brow) # vectorized multiply across all of B
-                for val in range(len(datapoints)):
-                    self.partials[rs[1][x]].append([rs[0], brow[1][val],datapoints[val]])
-            rs = self.aFetcher.nextRowSet()
-        self.aFetcher.resetRows()
-        
-    
-    def MergePartials(self):
-        self.endflag = False
-        out = Merger([deque()],None)
-        l6m = Merger([deque() for _ in range(2)],out)
-        l5m = Merger([deque() for _ in range(4)],l6m)
-        l4m = Merger([deque() for _ in range(8)],l5m)
-        l3m = Merger([deque() for _ in range(16)],l4m)
-        l2m = Merger([deque() for _ in range(32)],l3m)
-        l1m = Merger(self.partials,l2m)
-        
-        mergerArray = [out,l6m,l5m,l4m,l3m,l2m,l1m]
-        
-        
-        while bool(out.fifolist[0]) or not self.endflag:
-            self.numcycles += 1
-            out.MergeAndPush(0)
-            for p in range(6):
-                for val in range(2**(p)):
-                    c = mergerArray[p+1]
-                    n = mergerArray[p]
-                    # if the fifo in the next level is empty:
-                    if not bool(n.fifolist[val]) and (bool(c.fifolist[val*2]) or bool(c.fifolist[val*2+1])):
-                        c.MergeAndPush(val)
-                        break
-            # if the out fifo is empty, we check each layer to see if the entire thing is empty
-            if not bool(out.fifolist[0]):
-                for x in mergerArray:
-                    if bool(x):
-                        break
-                else:
-                    self.endflag = True
-
-
-
-
-def run_sparch(matrix1,matrix2):
-    
-    global total_memory_usage
-
-    merger = MultiplyAndMerge(matrix1,matrix2)
-    merger.MultiplyColumn()
-    merger.MergePartials()
-    
-    
-    data = []
-    i = []
-    j = []
-    
-    global truepartial
-    for x in truepartial:
-        i.append(x[0])
-        j.append(x[1])
-        data.append(x[2])
-    
-    truepartial = []
-
-    output = coo_matrix((data, (i,j)), shape= (matrix1.shape[0], matrix2.shape[1]))
-
-    print("number of cycles:", merger.numcycles )
-    print("Data Pulled from DRAM:", total_memory_usage)
-    if matrix1.size >= 10000 or matrix2.size >= 10000:
-        print("matrices too large to verify")
-    #else:
-    #    trueval = matrix1 @ matrix2
-    #    print("Verify that sparse multiplication is correct: ", np.allclose(output.toarray(),trueval,rtol=0.000001))
-    
-    total_memory_usage = 0
-    
-"""

@@ -53,34 +53,61 @@ class PE:
     # 4 - Look into queue overflow.
     # 5 - Basically all computation here happens in the PEs, need to be careful with the multiple sets of PEs, and properly using the adder tree.
     
-    def __init__(self, numQueues, PENumber) -> None:
+    def __init__(self, numQueues, PENumber, mode) -> None:
         self.inputBuffer = deque([])
         self.outputBuffer = deque([])
+        self.mode = mode
         
-        self.inputQueues = []
-        self.outputQueues = []
-        for x in range(0,numQueues):
-            self.inputQueues.append(deque([],maxlen=20000))
-            self.outputQueues.append(deque([],maxlen=20000))
-        self.inputQueuesLengths = [0] * numQueues # stores the length of each queue so the shortest one can be found efficiently.
         
-        self.helperQueueNumber = numQueues-1
-        self.currentQueueNumber = 0
-        self.tempI = None # this is used to switch I values while keeping track of previous I value so it can be shared to part 2
-        self.currentI = -1
-        self.prevI = -1
-        self.currentK = -1
-        self.PENumber = PENumber
-        self.numQueues = numQueues
-        self.endFlag = False # indicates end of processing
-        self.endFlag1 = False # indicates end of processing for part I
-        self.endFlag2 = False # indicates the next swap is the end of processing for part II
-        self.outputEmptyFlag = False # indicates that the outgoing queues are empty and ready to be swapped
-        self.inputFinishedFlag = False # indicates that i (row of a) has been incremented, and the queue set is ready to be swapped
-        self.inputFlag = False # indicates that the input queue is empty.
-        self.numWastedCycles = 0
-        self.partIWastedCycles = 0
-        self.partIIWastedCycles = 0
+        if mode != "SmallMerge":
+            self.inputQueues = []
+            self.outputQueues = []
+            for x in range(0,numQueues):
+                self.inputQueues.append(deque([],maxlen=20000))
+                self.outputQueues.append(deque([],maxlen=20000))
+            self.inputQueuesLengths = [0] * numQueues # stores the length of each queue so the shortest one can be found efficiently.
+
+            self.helperQueueNumber = numQueues-1
+            self.currentQueueNumber = 0
+            self.tempI = None # this is used to switch I values while keeping track of previous I value so it can be shared to part 2
+            self.currentI = -1
+            self.prevI = -1
+            self.currentK = -1
+            self.PENumber = PENumber
+            self.numQueues = numQueues
+            self.endFlag = False # indicates end of processing
+            self.endFlag1 = False # indicates end of processing for part I
+            self.endFlag2 = False # indicates the next swap is the end of processing for part II
+            self.outputEmptyFlag = False # indicates that the outgoing queues are empty and ready to be swapped
+            self.inputFinishedFlag = False # indicates that i (row of a) has been incremented, and the queue set is ready to be swapped
+            self.inputFlag = False # indicates that the input queue is empty.
+            self.numWastedCycles = 0
+            self.partIWastedCycles = 0
+            self.partIIWastedCycles = 0
+        else:  
+            self.inputQueues = [deque([]), deque([])]
+            self.outputQueues = [deque([]), deque([])]
+            self.helperQueueNumber = 0
+            self.currentQueueNumber = 1
+            self.outputQueueNumber = 0
+            self.currentK = -1
+            self.currentI = -1
+            self.tempI = None # this is used to switch I values while keeping track of previous I value so it can be shared to part 2
+            self.currentI = -1
+            self.prevI = -1
+            self.currentK = -1
+            self.PENumber = PENumber
+            self.numQueues = numQueues
+            self.endFlag = False # indicates end of processing
+            self.endFlag1 = False # indicates end of processing for part I
+            self.endFlag2 = False # indicates the next swap is the end of processing for part II
+            self.outputEmptyFlag = False # indicates that the outgoing queues are empty and ready to be swapped
+            self.inputFinishedFlag = False # indicates that i (row of a) has been incremented, and the queue set is ready to be swapped
+            self.inputFlag = False # indicates that the input queue is empty.
+            self.numWastedCycles = 0
+            self.partIWastedCycles = 0
+            self.partIIWastedCycles = 0
+        
         
         
     def __str__(self) -> str:
@@ -124,7 +151,112 @@ class PE:
             self.numWastedCycles += 1
             return
        
+
+        # BEGIN SMALLMERGE
+        if self.mode == "SmallMerge":
+            #print(self.outputEmptyFlag, self.inputFinishedFlag)
+            if self.outputEmptyFlag and self.inputFinishedFlag:
+
+                #print("SWAP")
+                self.outputEmptyFlag = False
+                self.inputFinishedFlag = False
+                
+                if self.endFlag2:
+                    self.endFlag = True
+                    return
+                if self.endFlag1: # If we are swapping and there is no more input, we need to swap one last time so the last numbers can be cleaned up
+                    #print("END2")
+                    self.endFlag2 = True
+                    self.inputFinishedFlag = True
+                    
+                #swap queue sets, set appropriate values, reset flags
+                temp = self.inputQueues
+                self.inputQueues = self.outputQueues
+                self.outputQueues = temp
+                
+                self.outputQueueNumber = self.currentQueueNumber
+
+                self.helperQueueNumber = 0
+                self.currentQueueNumber = 1
+                
+                self.prevI = self.currentI 
+                self.currentI = self.tempI #remember, tempI is set when the inputFinishedFlag is set, with the new value of I
+                
+                # NOTE: at this point, self.inputQueues should be full of empty queues, and all of its helper variables should be reset
+                # On the other hand, self.outputQueues should be full of values ready to be merged.
+                
+ 
+            # Part II
+            if not self.outputEmptyFlag:
+                
+                # Check if prevI is valid!
+                if self.prevI == -1:
+                    self.outputEmptyFlag = True
+                else:
+                    if self.outputQueues[self.outputQueueNumber]:
+                        v = self.outputQueues[self.outputQueueNumber].popleft()
+                        self.outputBuffer.append((v[0],self.prevI,v[1]))
+                    else:
+                        self.outputEmptyFlag = True
+            else:
+                self.partIIWastedCycles += 1
+
+            
+
+            # Part I
+            if not self.inputFinishedFlag or not self.endFlag1:
+                if not self.inputBuffer:
+                    self.inputFlag = False # If input buffer is empty, do not run
+                    return
+                
+                a, b, i, j, k = self.inputBuffer.popleft()
+                if a == None or k != self.currentK or i != self.currentI:
+                    l = len(self.inputQueues[self.currentQueueNumber])
+                    for x in range(l):
+                        self.inputQueues[self.helperQueueNumber].append(self.inputQueues[self.currentQueueNumber].popleft())
+                    temp = self.currentQueueNumber
+                    self.currentQueueNumber = self.helperQueueNumber
+                    self.helperQueueNumber = temp
+                    self.currentK = k
+                
+                if a == None:
+                    self.inputFlag = True
+                    self.inputFinishedFlag = True
+                    self.endFlag1 = True
+                    return # End of Processing
+
+                if i != self.currentI:
+                    # If I has been changed, then set the inputFinishedFlag and change currentI, and skip. Leave everything as-is, it will be taken care of above.
+                    self.inputBuffer.appendleft((a,b,i,j,k)) # return value to queue to be used after queue swap
+                    self.inputFinishedFlag = True
+                    self.tempI = i
+                    return #since part 2 is done before part 1, this can be done.
+                    
+                # Merging the two queues
+                if self.inputQueues[self.currentQueueNumber]: # Checks if there are any values left in the queue being merged
+                    c,colnum = self.inputQueues[self.currentQueueNumber].popleft()
+                    if colnum == j: # If Column number (of the value on top of the queue) and j (colnum of new data) are equal, merge and add
+                        #print("merge", c + a*b, j)
+                        self.inputQueues[self.helperQueueNumber].append((c + a*b,j))
+                    elif colnum < j: # if colnum is less than j
+                        #print("column", c, colnum)
+                        self.inputQueues[self.helperQueueNumber].append((c,colnum)) # put the value in the queue into the new queue
+                        self.inputBuffer.appendleft((a,b,i,j,k)) #put the value back into the input buffer, it's not getting used yet.
+                    else: #if j < colnum
+                        #print("add", a*b, j)
+                        self.inputQueues[self.helperQueueNumber].append((a*b,j))
+                        self.inputQueues[self.currentQueueNumber].appendleft((c,colnum))
+                else:
+                    self.inputQueues[self.helperQueueNumber].append((a*b,j)) # if the queue is empty, just add the new value.
+                return
+            else:
+                self.partIWastedCycles += 1
+            return
+    
+        # END SMALLMERGE
         
+        
+        # This is regular mode (not SmallMerge)
         if self.outputEmptyFlag and self.inputFinishedFlag:
             #print("SWAP")
             self.outputEmptyFlag = False
@@ -152,8 +284,6 @@ class PE:
             # On the other hand, self.outputQueues should be full of values ready to be merged.
 
             
-            
-        
         # Part II
         if not self.outputEmptyFlag:
             
@@ -185,6 +315,8 @@ class PE:
                     self.outputBuffer.append((val,self.prevI, col))
         else:
             self.partIIWastedCycles += 1
+            
+
         # Part I
         if not self.inputFinishedFlag or not self.endFlag1:
             if not self.inputBuffer:
@@ -194,8 +326,8 @@ class PE:
             
             a, b, i, j, k = self.inputBuffer.popleft() #Take the input for this cycle
             
-            if a == None or k != self.currentK:
-                #print("FLUSHING")
+            if a == None or k != self.currentK or i != self.currentI:
+                # print("FLUSHING")
                 # Check that K has not been changed, if changed then flush current queue into the helper, and set it as the new helper queue
                 # Remember, the "current" queue should ALWAYS be empty when swapping, because it has been flushed into the helper queue.
                 # This means that we use the helper queue as the new queue to merge into, choose the shortest queue (not including helper), and merge using that and the input
@@ -265,6 +397,7 @@ class PE:
             self.inputQueuesLengths[self.helperQueueNumber] += 1
         else:
             self.partIWastedCycles += 1
+        return
 
     
 class SpBL:
@@ -326,9 +459,11 @@ class SpBL:
             self.currentColumnBuffer = deque(self.B_column_ids[self.B_row_pointers[self.k][0]][self.B_row_pointers[self.k][1]:self.B_row_pointers[self.k][1] + self.B_row_lengths[self.k][1]])
             
             numBytes = len(self.currentColumnBuffer) * 4 + len(self.currentValueBuffer) * 4
-            # 128 bytes are requested in vector fashion (channel interleaving size = 128) - since we use C2SR, no data is wasted.
-            for x in range(0,numBytes//128+1):
-                ms = min(128,numBytes)
+            if numBytes == 0:
+                return
+            # 64 bytes are requested in vector fashion (channel interleaving size = 64) - since we use C2SR, no data is wasted.
+            for x in range(0,numBytes//64+1):
+                ms = min(64,numBytes)
                 self.memory.requestData(self,self.B_row_pointers[self.k][0],ms)
                 self.MemoryUsage += ms
         else:
@@ -392,11 +527,13 @@ class SpAL:
             self.currentValueBuffer = deque(self.A_values[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]])
             self.currentColumnBuffer = deque(self.A_column_ids[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]])
             numBytes = len(self.currentColumnBuffer)*4 + len(self.currentValueBuffer)*4 # 32-bit values and column numbers
-            for x in range(0,numBytes//128+1):
-                ms = min(128,numBytes)
+            if numBytes == 0:
+                return
+            for x in range(0,numBytes//64+1):
+                ms = min(64,numBytes)
                 self.memory.requestData(self,self.A_row_pointers[self.i][0],ms)
                 self.MemoryUsage += ms
-                numBytes -= 128
+                numBytes -= 64
         else:
             if self.freeBytes < 8:
                 self.memoryWastedCycles += 1
@@ -408,23 +545,22 @@ class SpAL:
             self.SpBL.input(a,self.i,k)
             
 class Memory:
-    def __init__(self, numChannels) -> None:
+    def __init__(self, numChannels, peakBandwidthPerChannel) -> None:
         self.numChannels = numChannels
         self.channelQueues = [deque() for _ in range(numChannels)]
-        self.channelCurrent = [[[None,0,0],[None,0,0]] for _ in range(numChannels)]
+        self.channelCurrent = [(None,0,0) for _ in range(numChannels)]
+        self.BPC = peakBandwidthPerChannel
     
     def requestData(self,loader, channel, amount):
         # numCycles includes the row and column latencies
-        self.channelQueues[channel].append([loader,amount,10]) # (loader, number of bytes, memory latency)
+        self.channelQueues[channel].append([loader,amount]) # (loader, number of bytes, memory latency)
     
     def cycle(self):
         for i,channel in enumerate(self.channelCurrent):
-            for x,request in enumerate(channel):
-                if request[2] <= 0 and request[1] > 0:
-                    request[0].freeBytes += 8 # "send" the bytes over to the PE. Each request has 8 bytes per cycle sent
-                    request[1] -= 8
-                elif request[2] > 0:
-                    request[2] -= 1
-                elif request[1] <= 0 and self.channelQueues[i]:
-                    self.channelCurrent[i][x] = self.channelQueues[i].popleft()
+            if channel[1] > 0:
+                sent = min(channel[1],self.BPC)
+                channel[0].freeBytes += sent # "send" the bytes over to the PE.
+                channel[1] -= sent
+            elif channel[1] <= 0 and self.channelQueues[i]:
+                self.channelCurrent[i] = self.channelQueues[i].popleft()
 
