@@ -58,7 +58,17 @@ def print_csf_tree(node, depth=0):
         print_csf_tree(child, depth + 1)
        
         
-        
+class Memory:
+    def __init__(self,di, li, Bandwidth) -> None: 
+        self.MemoryQueue = deque([])
+        self.peakBandwidth = Bandwidth
+        self.MemoryBusy = False
+    
+    def requestMemory(self,numBytes):
+        if not self.MemoryBusy:
+            self.MemoryBusy = True
+            
+            
 
 class DRAMIntersector:
     def __init__(self, mode) -> None:
@@ -77,6 +87,8 @@ class DRAMIntersector:
         self.nodeTwoIndices = []
         self.memoryAccessBytes = 0
         self.memoryWastedCycles = 0
+        self.numEmptyCycles = 0
+        self.memLatency = 0
         self.T = 32
         
     def __str__(self) -> str:
@@ -114,22 +126,26 @@ class DRAMIntersector:
                 coordCounter += 1
                 
         self.MemoryAccess(coordCounter * 2) # two bytes per coordinate!
-        # Normally, memory access would be done here! Both nodes are loaded up to the LLB metadata (due to post-intersection fill)
-        # Its easier to count when individual rows are 
         
     def MemoryAccess(self, numBytes):
         self.memoryAccessBytes += numBytes
-        self.memLatency = 70 + 15 + math.ceil(numBytes/128) #70 ns for fetching row, 15 for column latency, and then 128 bytes/cycle from then on, given 128gb/s and 1GhZ clock speed
-        self.memoryFlag = True
+        self.memLatency += math.ceil(numBytes/128) # We assume ideal conditions for memory, as done in the paper.
+        # since memory bandwidth is almost 100% utilized when pulling data, we just need to make sure that multiple data movements are not done 
+        # at the same time. However, in DRAM, this isn't really possible anyway since pulling this data is a requirement for any other
+        # data pulls to occur
+        
         
         
 
     def cycle(self) -> None:
-        if self.endFlag:                
+        if self.endFlag:  
+            self.numEmptyCycles += 1              
             return
         
         # if there are things being pulled from memory, don't cycle.
         if self.memoryFlag:
+            self.numEmptyCycles += 1
+            self.numEmptyCycles += 1
             self.memoryWastedCycles += 1
             self.memLatency -= 1
             if self.memLatency <= 0:
@@ -219,8 +235,10 @@ class LLBIntersector:
         self.i = 0
         self.memoryAccessBytes = 0
         self.memoryWastedCycles = 0
+        self.memLatency = 0
         self.node1LoadedTiles = set([])
         self.node2LoadedTiles = set([])
+        self.numEmptyCycles = 0
         self.T = 32
 
     def setNext(self,PEArray) -> None:
@@ -238,32 +256,27 @@ class LLBIntersector:
         self.inputBuffer.append((s1,s2))
         self.inputCoordBuffer.append((LLBrow,LLBcol))
         self.inputFlag = True
-        # load in the PE metadata!: (post intersection fill) This doesn't happen at DRAM because there is no data storage at that level.
-        coordCounter = 0
-        if s1 == None:
-            return 
-        for x in s1.children:
-            coordCounter += 1
-            coordCounter += len(s1.children[x].children)
-                
-        for x in s2.children:
-            coordCounter += 1
-            coordCounter += len(s2.children[x].children)
-                
-        self.MemoryAccess(coordCounter * 2) # two bytes per coordinate
+        # PE metadata is not loaded in yet. In the paper, it states the following:
+        # " Depending on the implementation, a separate mechanism may be required to fill the coordinates into the metadata storage. 
+        # For example, a cache based or scratchpad-based storage ills through demand loads from the iteration FSM or an 
+        # explicit fetch unit, respectively." 
+        # The LLB stores coordinate matches from the DRAM intersector, and the LLB pulls the next set of metadata from memory and stores it
+        # on-chip only when it needs to. 
                 
     
     
     def MemoryAccess(self, numBytes):
         self.memoryAccessBytes += numBytes
-        self.memLatency = 5 + math.ceil(numBytes/128) # Column latency of 5 cycles + 128 bytes/cycle, given 128gb/s and 1GhZ clock speed and the required values already being in row buffer - latency for this is calculated once
+        self.memLatency = math.ceil(numBytes/128) # Assume ideal bandwidth utilization. 
         self.memoryFlag = True
         
     def cycle(self) -> None:
         if self.endFlag or not self.inputFlag:
+            self.numEmptyCycles += 1
             return
     
         if self.memoryFlag:
+            self.numEmptyCycles += 1
             self.memoryWastedCycles += 1
             self.memLatency -= 1
             if self.memLatency <= 0:
@@ -286,7 +299,18 @@ class LLBIntersector:
                 self.nodeTwo = newNodes[1]
                 self.node1LoadedTiles = set([])
                 self.node2LoadedTiles = set([])
-                self.memLatency = 70 # this is because of the time taken to bring row into row buffer
+                # load in metadata
+                coordCounter = 0
+                for x in self.nodeOne.children:
+                    coordCounter += 1
+                    coordCounter += len(self.nodeOne.children[x].children)
+                        
+                for x in self.nodeTwo.children:
+                    coordCounter += 1
+                    coordCounter += len(self.nodeTwo.children[x].children)
+                        
+                self.MemoryAccess(coordCounter * 2) # two bytes per coordinate
+
                 self.i = 0
                 self.nodeOneIndices = sorted(list(self.nodeOne.children.keys()))
                 return
@@ -310,7 +334,18 @@ class LLBIntersector:
                 self.nodeTwo = newNodes[1]
                 self.node1LoadedTiles = set([])
                 self.node2LoadedTiles = set([])
-                self.memLatency = 70 # this is because of the time taken to bring row into row buffer
+                # load in metadata
+                coordCounter = 0
+                for x in self.nodeOne.children:
+                    coordCounter += 1
+                    coordCounter += len(self.nodeOne.children[x].children)
+                        
+                for x in self.nodeTwo.children:
+                    coordCounter += 1
+                    coordCounter += len(self.nodeTwo.children[x].children)
+                        
+                self.MemoryAccess(coordCounter * 2) # two bytes per coordinate
+                
                 self.i = 0
                 self.nodeOneIndices = sorted(list(self.nodeOne.children.keys()))
                 return
@@ -350,6 +385,7 @@ class LLBIntersector:
                     for x in node2[1].children:
                         byteCounter += 2 # 2 bytes of coordinate data per I/J coordinate at the PE tile level (output stationary)
                         byteCounter += len(node2[1].children[x].children) * 6 # 2 bytes for coordinate data per K coordinate at PE tile level, and 4 for its corresponding scalar int/float
+                        
                 if byteCounter:
                     self.MemoryAccess(byteCounter)
                 
@@ -718,7 +754,7 @@ class LLBBaselineIntersector:
     
     def MemoryAccess(self, numBytes):
         self.memoryAccessBytes += numBytes
-        self.memLatency = 5 + math.ceil(numBytes/128) # Column latency of 5 cycles + 128 bytes/cycle, given 128gb/s and 1GhZ clock speed and the required values already being in row buffer - latency for this is calculated once
+        self.memLatency = math.ceil(numBytes/128) # 128 bytes/cycle, given 128gb/s and 1GhZ clock speed and the required values already being in row buffer - latency for this is calculated once
         self.memoryFlag = True
         
     def cycle(self) -> None:
@@ -835,7 +871,7 @@ class PEBaselineIntersector:
     
     def MemoryAccess(self, numBytes):
         self.memoryAccessBytes += numBytes
-        self.memLatency = 5 + math.ceil(numBytes/128) # Column latency of 5 cycles + 128 bytes/cycle, given 128gb/s and 1GhZ clock speed and the required values already being in row buffer - latency for this is calculated once
+        self.memLatency = math.ceil(numBytes/128) # 128 bytes/cycle, given 128gb/s and 1GhZ clock speed and the required values already being in row buffer - latency for this is calculated once
         self.memoryFlag = True
         
     def cycle(self) -> None:

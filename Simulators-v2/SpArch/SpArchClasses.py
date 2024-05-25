@@ -3,7 +3,6 @@ from scipy.sparse import csr_matrix, coo_matrix
 from collections import deque
 import math
 import time
-gen = np.random.default_rng()
 
 
 class Scheduler:
@@ -21,6 +20,7 @@ class Scheduler:
         self.maxSchedule = ((len(self.MatrixARows)-2) % (numMergers-1)) + 2
         self.numMergers = numMergers
         self.merging = False
+        self.rounds = 0
 
     def addMatrix(self,num,size):
         self.StoredMatrices.append((num,size))
@@ -52,6 +52,7 @@ class Scheduler:
             self.StoredMatrices.pop()
             c += 1
         
+        self.rounds += 1
         self.maxSchedule = self.numMergers
         self.MatrixAFetcher.inputInstructions(numACols)
         self.MergeTree.inputPartials(numACols,matrices,PMlength)
@@ -81,19 +82,26 @@ class Memory:
         self.channelQueues = [deque() for _ in range(numChannels)]
         self.channelCurrent = [(None,0,0) for _ in range(numChannels)]
         self.BPC = peakBandwidthPerChannel
+        self.TotalMemoryPulled = 0
+        self.NumCyclesInUse = 0 #use this for memory efficiency when in use.
     
     def requestData(self,loader, channel, amount):
         # numCycles includes the row and column latencies
         self.channelQueues[channel].append([loader,amount]) # (loader, number of bytes, memory latency)
     
     def cycle(self):
+        inuse = False
         for i,channel in enumerate(self.channelCurrent):
             if channel[1] > 0:
+                inuse = True
                 sent = min(channel[1],self.BPC)
-                channel[0].freeBytes += sent # "send" the bytes over to the PE.
+                self.TotalMemoryPulled += sent
+                channel[0].freeBytes += sent # "send" the bytes over
                 channel[1] -= sent
             elif channel[1] <= 0 and self.channelQueues[i]:
                 self.channelCurrent[i] = self.channelQueues[i].popleft()
+        if inuse:
+            self.NumCyclesInUse += 1
             
         
         
@@ -198,16 +206,31 @@ class MatrixAFetcher:
             return
         
         if self.rowLengths[self.currentRow] > self.currentCondensedColumn:
+            # i = the exact point in the data and column arrays where the condensed column set starts
             i = self.A.indptr[self.currentRow] + self.currentCondensedColumn
             if self.rowLengths[self.currentRow] - self.currentCondensedColumn < self.currentNumColumns: 
                 end = self.A.indptr[self.currentRow+1]
             else:
                 end = self.currentNumColumns + self.A.indptr[self.currentRow] + self.currentCondensedColumn
+                
+            # because channels are assigned cyclically, and each of 16 channels is 64 values wide, after 16 * 64 values, we'll be in the same spot within the same channel
+            # C finds us which channel we start at, and o finds us the offset from the beginning of the channel
+            O = (i%64)
+            C = (i//64)%16
             for x in range(i,end):
                 self.memoryUse += 4 * 2 # each int is 32 bits (or 4 bytes), and there are 2 of them to fetch (data & col). 8 bytes are fetched
                 # from a random channel. To simplify things, we assume that every 8 bytes fetched correspond
                 # to a set of data to be sent to the Distance List Builder, and send a value every 8 bytes that are fetched from memory.
-                self.memory.requestData(self,gen.integers(0,15),8)
+
+                # we request chunks of 8 bytes
+                self.memory.requestData(self,C,8)
+                # increment offset. If we move to a new channel, increment the channel number mod 8
+                O += 8
+                O %= 64
+                if O < 8:
+                    C += 1
+                    C %= 16
+                    
                 self.memoryQueue.append((self.A.data[x],self.currentRow,self.A.indices[x],x-i)) # data has to be sent in order
         self.currentRow += 1
     
@@ -296,6 +319,9 @@ class MatrixBPrefetcher:
         self.memoryAccessBytes = 0
         self.freeBytes = 0
         self.rowsToFetch = 0
+        
+        self.wastedCycles = 0
+        
 
     def running(self, event):
         while not self.endFlag:
@@ -363,26 +389,37 @@ class MatrixBPrefetcher:
         self.memory = M
         
         
-    def memoryAccess(self, numRows):
+    def memoryAccess(self, numRows, rowNum, currentLocation):
         if numRows == 0:
             return
-        # we make use of 16 fetchers, so assuming each fetcher takes about the same time to load a row, ceil(numbytes/16)
-        # Each row is 48 elements, and each element is 12 bytes
-        self.memoryAccessBytes += numRows * 48 * 12 
         
-        # The number of rows that need to be fetched by each fetcher:
-        # we assume a "perfect split" 
-        numRowsPerFetcher = numRows//16
-        additional = numRows%16
-        for x in range(16):
-            if additional > x:
-                self.memory.requestData(self,x,(numRowsPerFetcher + 1)*48)
-            else:
-                self.memory.requestData(self,x,numRowsPerFetcher*48)
+        # Each row is 48 elements, and each element is 12 bytes
+        numBytes = numRows * 48 * 12 
+        
+        # C finds us which channel we start at, and o finds us the offset from the beginning of the channel
+        # rowNum is the row we're pulling, and currentLocation is how far in we are at this point.
+        locationInList = self.B.indptr[rowNum] + currentLocation
+        O = (locationInList%64)
+        C = (locationInList//64)%8
+        # we request chunks of 8 bytes, that's the peak memory bandwidth anyway so we don't lose anything
+        # might be tempting to do chunks of 12 bytes, but that runs the risk of splitting across channels 
+        # and also makes the data end up streaming slower (taking 2 cycles instead of 1)
+        for x in range(0,(numBytes//8) + 1):
+            ms = min(8,numBytes)
+            self.memory.requestData(self,C,ms)
+            self.memoryAccessBytes += ms
+            numBytes -= ms
+            # increment offset. If we move to a new channel, increment the channel number mod 8
+            O += 8
+            O %= 64
+            if O < 8:
+                C += 1
+                C %= 8
         self.rowsToFetch = numRows # when this hits 0, the B prefetcher is done loading all data
     
     def cycle(self):
         if self.endFlag or not self.inputFlag:
+            self.wastedCycles += 1
             return
         
         if self.currentRowSendingFinished and self.nextRowLoadingFinished:
@@ -410,8 +447,7 @@ class MatrixBPrefetcher:
                 self.nextRowLoadingFinished = True
                 return
             # Checks if the furthest row still has values to replace
-            if self.prefetchBufferHash[self.furthestRowInPrefetcher] != 0:
-                                                
+            if self.prefetchBufferHash[self.furthestRowInPrefetcher] != 0:                                                
                 # the cap on the number of cycles it'll take is either the amount of open space in the furthest row of the prefetcher
                 # or, the amount of data actually needed to fill the row into the prefetcher.  We do a memory load of this size, 
                 # and if we finish loading after this memory access, we set nextRowLoadingFinished to True. 
@@ -435,7 +471,7 @@ class MatrixBPrefetcher:
                 else:
                     self.prefetchBufferHash[self.nextRowNumber] = amountDataNeeded
                 
-                self.memoryAccess(amountDataNeeded) # pull indices and data into the buffer, this is counted in terms of prefetch buffer lines
+                self.memoryAccess(amountDataNeeded, self.nextRowNumber, self.nextRowPointer) # pull indices and data into the buffer, this is counted in terms of prefetch buffer lines
             else:
                 # this code runs when the fetchers need a new place to fill in the buffer, it selects a new furthest row, and deletes the current
                 # furthest row in the prefetchBufferHash
@@ -444,7 +480,7 @@ class MatrixBPrefetcher:
                 maximum = -1
                 for key in self.prefetchBufferHash:
                     v = self.rowDistanceHash[key]
-                    if v == []:
+                    if not v:
                         maximum = key
                         break
                     if self.rowDistanceHash[maximum] == []:
@@ -456,9 +492,9 @@ class MatrixBPrefetcher:
         elif self.rowsToFetch > 0:
             # reduce the number of rows to fetch by one for every 48 bytes that get fetched
             # since we don't use the bytes until the entire row is fetched, the order doesn't really matter anyway
-            while self.freeBytes >= 48:
+            while self.freeBytes >= 48 * 12:
                 self.rowsToFetch -= 1
-                self.freeBytes -= 48
+                self.freeBytes -= 48 * 12
             return
                                
 
@@ -480,6 +516,8 @@ class MultiplierArray:
         # we don't need the original column of A, but we do need a set of columns for B
         self.Temp_Bcols = []
         self.Temp_Brow = []
+        
+        self.wastedCycles = 0
 
     def running(self, event):
         while not self.endFlag:
@@ -525,6 +563,7 @@ class MultiplierArray:
     def cycle(self):
         # this acts as the "input flag" that we have on other parts
         if self.scheduler.merging or self.endFlag:
+            self.wastedCycles += 1
             return
 
         if self.Brow:
@@ -572,6 +611,10 @@ class MergeTree:
         self.loadingPartials = False
         self.partialMatrices = []
         self.memoryLatency = 0
+        self.wastedCycles = 0
+        self.idleCycles = 0
+        self.totalMergeCycles = 0
+        self.totalEmptyFifos = 0
     
     def reset(self):
         self.merging = False
@@ -615,18 +658,26 @@ class MergeTree:
     
     def cycle(self):
         if self.endFlag:
+            self.wastedCycles += 1
             return
         if self.loadingPartials:
             if self.memoryLatency <= 0:
                 self.loadingPartials = False
             else:
                 self.memoryLatency -= 128
-                return
+        elif not self.merging:
+            # not loading partials or merging, so its a wasted cycle
+            self.wastedCycles += 1
+            return
         if not self.merging:
+            # this can't be merged with the EndFlag above, because we need to load partials while not merging
+            # loading partials and not merging, idle cycle
+            self.idleCycles += 1
             return
 
         
         # first, we choose which queue we will fill up in each row
+        emptyFifos = 0
         chosenQueues = []
 
         for i in range(1,len(self.fifos)):
@@ -636,24 +687,30 @@ class MergeTree:
                 for queue in self.fifos[i]:
                     if len(queue[0]) < self.mergeSize and queue[1]:
                         newVal = False
-                        break
+                    elif len(queue[0]) == 0 and not queue[1]:
+                        emptyFifos += 1
                 self.loaded[i] = newVal
 
             if self.loaded[i-1]:
                 minimum = 10000000 # unrealistic, impossible number
                 queueToFill = -1
                 for num,queue in enumerate(self.fifos[i]):                    
-                    
                     # conditions: length of queue is shorter than current lowest, the queue has not "dried up", 
                     # and its two lower values are either dried up or have more than 16 values inside them.
                     if len(queue[0]) < minimum and queue[1] and (len(self.fifos[i-1][num*2][0]) > self.mergeSize or not self.fifos[i-1][num*2][1]) and (len(self.fifos[i-1][num*2 + 1][0]) > self.mergeSize or not self.fifos[i-1][num*2 + 1][1]):
                         minimum = len(queue)
                         queueToFill = num
+                    elif len(queue[0]) == 0 and not queue[1]:
+                        # this means that in this cycle the queue is empty, and will not be used again.
+                        # we don't consider queues that could be used again for this, because they could only be empty for this cycle
+                        # and are very much an important part of the computation (they are being utilized in some way)
+                        emptyFifos += 1
                 chosenQueues.append(queueToFill) # the queue we will be filling using the ith comparator array is queueToFill
             else:
                 # if the subqueues have not been loaded yet:
                 chosenQueues.append(None) 
-        
+        self.totalMergeCycles += 1
+        self.totalEmptyFifos += emptyFifos/64
         # in this iteration, a few things can happen:
         # 1) the prior layer is not full enough to begin merging (chosenQueues has None)
         # 2) the merger was unable to choose a queue to fill (chosenQueues has -1). In this case, we don't do anything

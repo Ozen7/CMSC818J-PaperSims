@@ -57,7 +57,22 @@ class PE:
         self.inputBuffer = deque([])
         self.outputBuffer = deque([])
         self.mode = mode
-        
+        self.flushLatency = 0
+        self.tempI = None # this is used to switch I values while keeping track of previous I value so it can be shared to part 2
+        self.currentI = -1
+        self.prevI = -1
+        self.currentK = -1
+        self.PENumber = PENumber
+        self.numQueues = numQueues
+        self.endFlag = False # indicates end of processing
+        self.endFlag1 = False # indicates end of processing for part I
+        self.endFlag2 = False # indicates the next swap is the end of processing for part II
+        self.outputEmptyFlag = False # indicates that the outgoing queues are empty and ready to be swapped
+        self.inputFinishedFlag = False # indicates that i (row of a) has been incremented, and the queue set is ready to be swapped
+        self.inputFlag = False # indicates that the input queue is empty.
+        self.numWastedCycles = 0
+        self.partIWastedCycles = 0
+        self.partIIWastedCycles = 0
         
         if mode != "SmallMerge":
             self.inputQueues = []
@@ -66,47 +81,14 @@ class PE:
                 self.inputQueues.append(deque([],maxlen=20000))
                 self.outputQueues.append(deque([],maxlen=20000))
             self.inputQueuesLengths = [0] * numQueues # stores the length of each queue so the shortest one can be found efficiently.
-
             self.helperQueueNumber = numQueues-1
             self.currentQueueNumber = 0
-            self.tempI = None # this is used to switch I values while keeping track of previous I value so it can be shared to part 2
-            self.currentI = -1
-            self.prevI = -1
-            self.currentK = -1
-            self.PENumber = PENumber
-            self.numQueues = numQueues
-            self.endFlag = False # indicates end of processing
-            self.endFlag1 = False # indicates end of processing for part I
-            self.endFlag2 = False # indicates the next swap is the end of processing for part II
-            self.outputEmptyFlag = False # indicates that the outgoing queues are empty and ready to be swapped
-            self.inputFinishedFlag = False # indicates that i (row of a) has been incremented, and the queue set is ready to be swapped
-            self.inputFlag = False # indicates that the input queue is empty.
-            self.numWastedCycles = 0
-            self.partIWastedCycles = 0
-            self.partIIWastedCycles = 0
         else:  
             self.inputQueues = [deque([]), deque([])]
             self.outputQueues = [deque([]), deque([])]
             self.helperQueueNumber = 0
             self.currentQueueNumber = 1
             self.outputQueueNumber = 0
-            self.currentK = -1
-            self.currentI = -1
-            self.tempI = None # this is used to switch I values while keeping track of previous I value so it can be shared to part 2
-            self.currentI = -1
-            self.prevI = -1
-            self.currentK = -1
-            self.PENumber = PENumber
-            self.numQueues = numQueues
-            self.endFlag = False # indicates end of processing
-            self.endFlag1 = False # indicates end of processing for part I
-            self.endFlag2 = False # indicates the next swap is the end of processing for part II
-            self.outputEmptyFlag = False # indicates that the outgoing queues are empty and ready to be swapped
-            self.inputFinishedFlag = False # indicates that i (row of a) has been incremented, and the queue set is ready to be swapped
-            self.inputFlag = False # indicates that the input queue is empty.
-            self.numWastedCycles = 0
-            self.partIWastedCycles = 0
-            self.partIIWastedCycles = 0
         
         
         
@@ -200,11 +182,9 @@ class PE:
                         self.outputEmptyFlag = True
             else:
                 self.partIIWastedCycles += 1
-
             
-
             # Part I
-            if not self.inputFinishedFlag or not self.endFlag1:
+            if (not self.inputFinishedFlag or not self.endFlag1) and self.flushLatency == 0:
                 if not self.inputBuffer:
                     self.inputFlag = False # If input buffer is empty, do not run
                     return
@@ -214,10 +194,15 @@ class PE:
                     l = len(self.inputQueues[self.currentQueueNumber])
                     for x in range(l):
                         self.inputQueues[self.helperQueueNumber].append(self.inputQueues[self.currentQueueNumber].popleft())
+                    self.flushLatency = l
                     temp = self.currentQueueNumber
                     self.currentQueueNumber = self.helperQueueNumber
                     self.helperQueueNumber = temp
                     self.currentK = k
+                    # we need to wait!
+                    if self.flushLatency > 0:
+                        self.flushLatency -= 1
+                        return
                 
                 if a == None:
                     self.inputFlag = True
@@ -249,6 +234,8 @@ class PE:
                 else:
                     self.inputQueues[self.helperQueueNumber].append((a*b,j)) # if the queue is empty, just add the new value.
                 return
+            elif self.flushLatency > 0:
+                self.flushLatency -= 1
             else:
                 self.partIWastedCycles += 1
             return
@@ -318,7 +305,7 @@ class PE:
             
 
         # Part I
-        if not self.inputFinishedFlag or not self.endFlag1:
+        if (not self.inputFinishedFlag or not self.endFlag1) and self.flushLatency <= 0:
             if not self.inputBuffer:
                 self.inputFlag = False # If input buffer is empty, do not run
                 return
@@ -327,7 +314,6 @@ class PE:
             a, b, i, j, k = self.inputBuffer.popleft() #Take the input for this cycle
             
             if a == None or k != self.currentK or i != self.currentI:
-                # print("FLUSHING")
                 # Check that K has not been changed, if changed then flush current queue into the helper, and set it as the new helper queue
                 # Remember, the "current" queue should ALWAYS be empty when swapping, because it has been flushed into the helper queue.
                 # This means that we use the helper queue as the new queue to merge into, choose the shortest queue (not including helper), and merge using that and the input
@@ -338,6 +324,8 @@ class PE:
                 l = len(self.inputQueues[self.currentQueueNumber])
                 for x in range(l):
                     self.inputQueues[self.helperQueueNumber].append(self.inputQueues[self.currentQueueNumber].popleft())
+                self.flushLatency = l
+
                 # adjust queue sizes
                 self.inputQueuesLengths[self.helperQueueNumber] += l
                 self.inputQueuesLengths[self.currentQueueNumber] = 0
@@ -355,6 +343,8 @@ class PE:
                     self.currentQueueNumber += 1
                 
                 self.currentK = k
+                
+
             
             if a == None:
                 self.inputFlag = True
@@ -369,7 +359,11 @@ class PE:
                 self.tempI = i
                 return #since part 2 is done before part 1, this can be done.
             
-
+            # we need to wait!
+            if self.flushLatency > 0:
+                self.flushLatency -= 1
+                self.inputBuffer.appendleft((a,b,i,j,k))
+                return
                 
             # The actual computation (According to paper, when k is incremented, there is still a value generated in that cycle)
             
@@ -395,18 +389,20 @@ class PE:
 
             # increment length of helper queue
             self.inputQueuesLengths[self.helperQueueNumber] += 1
+        elif self.flushLatency > 0:
+            self.flushLatency -= 1
         else:
             self.partIWastedCycles += 1
         return
 
     
 class SpBL:
-    def __init__(self, ChannelNumber) -> None: # NEED TO FIGURE OUT SPEED OF MEMORY
+    def __init__(self, mode) -> None:
+        self.mode = mode
         self.inputBuffer = deque([])
         self.inputFlag = False
         self.endFlag = False
         self.newAFlag = False
-        self.C = ChannelNumber
         self.B_values, self.B_column_ids, self.B_row_lengths, self.B_row_pointers = (None,None,None,None) # Stored in C2SR format
         self.PE = None
         self.currentValueBuffer = deque([]) # This is a buffer containing all of the stuff to be sent to the PE one by one.
@@ -414,7 +410,6 @@ class SpBL:
         self.a = 0
         self.i = 0
         self.k = 0
-        
         self.memory = None
         self.memoryWastedCycles = 0
         self.MemoryUsage = 0
@@ -434,7 +429,10 @@ class SpBL:
         self.inputFlag = True
         
     def loadMatrixB(self, BMatrix):
-        self.B_values, self.B_column_ids, self.B_row_lengths, self.B_row_pointers = BMatrix
+        if self.mode == "CSR":
+            self.B_values, self.B_column_ids, self.B_row_pointers = BMatrix
+        else:
+            self.B_values, self.B_column_ids, self.B_row_lengths, self.B_row_pointers = BMatrix
         
     
     def cycle(self):
@@ -453,10 +451,38 @@ class SpBL:
                 self.endFlag = True
                 self.PE.input(None,None,None,None,None)
                 return
-        
+            
+            # in order to simulate CSR, we need to find the channel number for each datapoint we request data for             
+            if self.mode == "CSR":
+                self.currentValueBuffer = deque(self.B_values[self.B_row_pointers[self.k]:self.B_row_pointers[self.k+1]])
+                self.currentColumnBuffer = deque(self.B_column_ids[self.B_row_pointers[self.k]:self.B_row_pointers[self.k+1]])
+                
+                
+                numBytes = len(self.currentColumnBuffer) * 4 + len(self.currentValueBuffer) * 4
+                if numBytes == 0:
+                    return
+                # because channels are assigned cyclically, and each of 8 channels is 64 values wide, after 8 * 64 values, we'll be in the same spot within the same channel
+                # C finds us which channel we start at, and o finds us the offset from the beginning of the channel
+                O = (self.B_row_pointers[self.k]%64)
+                C = (self.B_row_pointers[self.k]//64)%8
+                # we request chunks of 8 bytes, so that there is no risk of pulling from multiple channels (Part A of the Evaluation)
+                for x in range(0,numBytes//8):
+                    ms = 8
+                    self.memory.requestData(self,C,ms)
+                    self.MemoryUsage += ms
+                    # increment offset. If we move to a new channel, increment the channel number mod 8
+                    O += 8
+                    O %= 64
+                    if O < 8:
+                        C += 1
+                        C %= 8
+                return
+
+                
+            C = self.B_row_pointers[self.k][0]
             # Because we are loading from matrix B, We need to check where each row is (channel and location) using row lengths and pointers
-            self.currentValueBuffer = deque(self.B_values[self.B_row_pointers[self.k][0]][self.B_row_pointers[self.k][1]:self.B_row_pointers[self.k][1] + self.B_row_lengths[self.k][1]])
-            self.currentColumnBuffer = deque(self.B_column_ids[self.B_row_pointers[self.k][0]][self.B_row_pointers[self.k][1]:self.B_row_pointers[self.k][1] + self.B_row_lengths[self.k][1]])
+            self.currentValueBuffer = deque(self.B_values[C][self.B_row_pointers[self.k][1]:self.B_row_pointers[self.k][1] + self.B_row_lengths[self.k][1]])
+            self.currentColumnBuffer = deque(self.B_column_ids[C][self.B_row_pointers[self.k][1]:self.B_row_pointers[self.k][1] + self.B_row_lengths[self.k][1]])
             
             numBytes = len(self.currentColumnBuffer) * 4 + len(self.currentValueBuffer) * 4
             if numBytes == 0:
@@ -464,7 +490,8 @@ class SpBL:
             # 64 bytes are requested in vector fashion (channel interleaving size = 64) - since we use C2SR, no data is wasted.
             for x in range(0,numBytes//64+1):
                 ms = min(64,numBytes)
-                self.memory.requestData(self,self.B_row_pointers[self.k][0],ms)
+                self.memory.requestData(self,C,ms)
+                numBytes -= ms
                 self.MemoryUsage += ms
         else:
             if self.freeBytes < 8:
@@ -482,7 +509,8 @@ class SpBL:
     
     
 class SpAL:
-    def __init__(self, ChannelNumber, numChannels) -> None:
+    def __init__(self, ChannelNumber, numChannels, mode) -> None:
+        self.mode = mode
         self.endFlag = False
         self.C = ChannelNumber
         self.numChannels = numChannels
@@ -503,12 +531,48 @@ class SpAL:
         self.memory = m
     
     def loadMatrixA(self, AMatrix):
+        if self.mode == "CSR":
+            self.A_values, self.A_column_ids, self.A_row_pointers = AMatrix
+            self.currentValueBuffer = deque(self.A_values[self.A_row_pointers[self.i]:self.A_row_pointers[self.i+1]])
+            self.currentColumnBuffer = deque(self.A_column_ids[self.A_row_pointers[self.i]:self.A_row_pointers[self.i+1]])
+            
+            
+            numBytes = len(self.currentColumnBuffer) * 4 + len(self.currentValueBuffer) * 4
+            if numBytes == 0:
+                return
+            # because channels are assigned cyclically, and each of 8 channels is 64 values wide, after 8 * 64 values, we'll be in the same spot within the same channel
+            # C finds us which channel we start at, and o finds us the offset from the beginning of the channel
+            O = (self.A_row_pointers[self.i]%64)
+            C = (self.A_row_pointers[self.i]//64)%8
+            # we request chunks of 8 bytes, so that there is no risk of pulling from multiple channels (Part A of the Evaluation)
+            for x in range(0,numBytes//8):
+                ms = 8
+                self.memory.requestData(self,C,ms)
+                self.MemoryUsage += ms
+                # increment offset. If we move to a new channel, increment the channel number mod 8
+                O += 8
+                O %= 64
+                if O < 8:
+                    C += 1
+                    C %= 8
+            return
+            
+        
         self.A_values, self.A_column_ids, self.A_row_lengths, self.A_row_pointers = AMatrix # Stored in C2SR format
+
+        
         self.currentValueBuffer = deque(self.A_values[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]]) # First set of values (one row of A)
         self.currentColumnBuffer = deque(self.A_column_ids[self.C][self.A_row_pointers[self.i][1]:self.A_row_pointers[self.i][1] + self.A_row_lengths[self.i][1]]) # First set of column numbes (one row of A)
+        
+        
         numBytes = len(self.currentColumnBuffer)*4 + len(self.currentValueBuffer)*4 # 32-bit values and column numbers
-        self.memory.requestData(self,self.C,numBytes)
-        self.MemoryUsage += numBytes
+        if numBytes == 0:
+            return
+        for x in range(0,numBytes//64+1):
+            ms = min(64,numBytes)
+            self.memory.requestData(self,self.A_row_pointers[self.i][0],ms)
+            self.MemoryUsage += ms
+            numBytes -= ms
     
     def __str__(self) -> str:
         return "i: " + str(self.i) + ", ValueBuffer: " + str(self.currentValueBuffer) + ", ColumnBuffer: " + str(self.currentColumnBuffer)
@@ -520,6 +584,37 @@ class SpAL:
         
         if not self.currentValueBuffer:
             self.i += self.numChannels
+            # in order to simulate CSR, we need to find the channel number for each datapoint we request data for             
+            if self.mode == "CSR":
+                if self.i >= len(self.A_row_pointers)-1:
+                    self.SpBL.input(None,None,None)
+                    self.endFlag = True
+                    return
+                self.currentValueBuffer = deque(self.A_values[self.A_row_pointers[self.i]:self.A_row_pointers[self.i+1]])
+                self.currentColumnBuffer = deque(self.A_column_ids[self.A_row_pointers[self.i]:self.A_row_pointers[self.i+1]])
+                
+                
+                numBytes = len(self.currentColumnBuffer) * 4 + len(self.currentValueBuffer) * 4
+                if numBytes == 0:
+                    return
+                # because channels are assigned cyclically, and each of 8 channels is 64 values wide, after 8 * 64 values, we'll be in the same spot within the same channel
+                # C finds us which channel we start at, and o finds us the offset from the beginning of the channel
+                O = (self.A_row_pointers[self.i]%64)
+                C = (self.A_row_pointers[self.i]//64)%8
+                # we request chunks of 8 bytes, so that there is no risk of pulling from multiple channels (Part A of the Evaluation)
+                for x in range(0,numBytes//8):
+                    ms = 8
+                    self.memory.requestData(self,C,ms)
+                    self.MemoryUsage += ms
+                    # increment offset. If we move to a new channel, increment the channel number mod 8
+                    O += 8
+                    O %= 64
+                    if O < 8:
+                        C += 1
+                        C %= 8
+                return
+            
+            
             if self.i >= len(self.A_row_pointers):
                 self.SpBL.input(None,None,None)
                 self.endFlag = True
@@ -533,7 +628,7 @@ class SpAL:
                 ms = min(64,numBytes)
                 self.memory.requestData(self,self.A_row_pointers[self.i][0],ms)
                 self.MemoryUsage += ms
-                numBytes -= 64
+                numBytes -= ms
         else:
             if self.freeBytes < 8:
                 self.memoryWastedCycles += 1
@@ -550,17 +645,24 @@ class Memory:
         self.channelQueues = [deque() for _ in range(numChannels)]
         self.channelCurrent = [(None,0,0) for _ in range(numChannels)]
         self.BPC = peakBandwidthPerChannel
+        self.TotalMemoryPulled = 0
+        self.NumCyclesInUse = 0 #use this for memory efficiency when in use.
     
     def requestData(self,loader, channel, amount):
         # numCycles includes the row and column latencies
         self.channelQueues[channel].append([loader,amount]) # (loader, number of bytes, memory latency)
     
     def cycle(self):
+        inuse = False
         for i,channel in enumerate(self.channelCurrent):
             if channel[1] > 0:
+                inuse = True
                 sent = min(channel[1],self.BPC)
+                self.TotalMemoryPulled += sent
                 channel[0].freeBytes += sent # "send" the bytes over to the PE.
                 channel[1] -= sent
             elif channel[1] <= 0 and self.channelQueues[i]:
                 self.channelCurrent[i] = self.channelQueues[i].popleft()
+        if inuse:
+            self.NumCyclesInUse += 1
 
