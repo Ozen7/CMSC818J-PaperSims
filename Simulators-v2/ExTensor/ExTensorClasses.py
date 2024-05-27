@@ -465,6 +465,14 @@ class PEArray:
         self.inputFlag = True
     
     def cycle(self) -> None:
+        # iterate through all PEs and cycle them one by one
+        f = True
+        for P in self.PEs:
+            P.cycle()
+            f = f and P.endFlag
+        self.endFlag = f 
+            
+        # send a value to a PE
         if self.endFlag or not self.inputFlag:
             return
         if not self.inputBuffer:
@@ -472,12 +480,12 @@ class PEArray:
             return
         i = self.inputBuffer.popleft()
         if i[0] == None or i[1] == None:
-            self.endFlag = True
             for x in self.PEs:
                 x.load((None,None,None,None))
         self.PEs[self.currentPE].load(i)
         self.currentPE += 1
         self.currentPE %= self.numPEs
+        
 
     
 

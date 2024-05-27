@@ -259,8 +259,293 @@ class DistanceListBuilder:
         
     def sendInput(self):
         self.Multiplier.loadAvalue(self.lookaheadFIFO.popleft())
+   
+   
+class MatrixBCache:
+    # Instead of keeping track of future accesses, we only keep track of past accesses and decide which value to remove based on age
+    # the older a row is, the less valuable.
+    # Make a version where we do prefetch the next value, but don't look ahead, and make a version where we don't prefetch or look ahead.
+    def __init__(self, isPrefetch, B:csr_matrix) -> None:
+        self.endFlag = False
+        self.isPrefetch = isPrefetch
+        self.B = B
         
+        self.timeStep = 0
+        self.inputFlag = False
+        self.prefetchBufferHash = {-1: 1024} # initially, every single set in the row is empty (assigned to -1), there are 1024 lines
+        self.rowAgeHash = {-1: 0}
+        self.multiplierArray = None
+        self.memory = None
+        
+        self.inputBuffer = deque([])
+        self.oldestRowInCache = -1
+
+        
+        self.currentRowPointer = 0 # Used for row that is being sent to multiplier 
+        self.currentRowSendingFinished = True # indicates that the current row has been fully sent. Starts as true, but is set to false in the first cycle
+        self.currentRowNumber = -1 # current row number. Used for accessing rowAgeHash and prefetchBufferHash
+        self.currentRowData = [] # The current row's Data
+        self.currentRowIndices = [] # The current row's column indices
+        
+        
+        if self.isPrefetch:
+            self.nextRowPointer = 0 # Used for row that is being loaded into buffer
+            self.nextRowLoadingFinished = True # same as above, indicates that next row has been fully loaded.
+            self.nextRowNumber = -1 # next row number. Used for accessing rowAgeHash and prefetchBufferHash
+            self.nextRowData = [] # The next row's Data
+            self.nextRowIndices = [] # The next row's column indices
+        else:
+            self.currentRowLoadingFinished = True
+        
+        self.memoryWastedCycles = 0
+        self.memoryAccessBytes = 0
+        self.freeBytes = 0
+        self.rowsToFetch = 0
+        
+        self.wastedCycles = 0
+        pass  
     
+    
+    def takeTimeStep(self):
+        self.inputFlag = False
+        self.timeStep += 1
+        
+        # All data from next row is now the current row, and we begin sending it to the multiplier each cycle
+        if self.isPrefetch:
+            self.currentRowPointer = 0
+            self.currentRowData = self.nextRowData
+            self.currentRowIndices = self.nextRowIndices
+            self.currentRowNumber = self.nextRowNumber
+            self.currentRowSendingFinished = self.currentRowNumber == -1 # if our row number is -1, we are "done" sending data. O.W, we are sending data
+
+            # Indicate to DLB that a new A value should be sent, since we're done sending everything for our row now.
+            if self.currentRowNumber != -1:
+                self.DistanceListBuilder.sendInput()
+            
+            # If there is nothing left in the distance fifo, nothing is loaded for this timestep,
+            # even if something is sent in the middle of sending to multiplier it won't be loaded until the next timestep
+            self.nextRowNumber = -1
+            self.nextRowData = []
+            self.nextRowIndices = []
+            self.nextRowPointer = 0
+            if self.inputBuffer:
+                self.nextRowNumber = self.inputBuffer.popleft()
+                self.nextRowLoadingFinished = False
+                self.nextRowIndices = list(self.B.indices[self.B.indptr[self.nextRowNumber]:self.B.indptr[self.nextRowNumber+1]])
+                self.nextRowData = list(self.B.data[self.B.indptr[self.nextRowNumber]:self.B.indptr[self.nextRowNumber+1]])
+                if self.nextRowNumber in self.prefetchBufferHash:
+                    self.nextRowPointer = self.prefetchBufferHash[self.nextRowNumber]*48 #default is 0
+                    
+            # If something is being loaded or sent:
+            if not (self.nextRowLoadingFinished and self.currentRowSendingFinished):
+                self.inputFlag = True
+        else:
+
+
+            self.currentRowNumber = -1
+            self.currentRowData = []
+            self.currentRowIndices = []
+            self.currentRowPointer = 0
+            self.currentRowLoadingPointer = 0
+            if self.inputBuffer:
+                self.inputFlag = True
+                self.currentRowNumber = self.inputBuffer.popleft()
+                self.currentRowLoadingFinished = False
+                self.currentRowIndices = list(self.B.indices[self.B.indptr[self.currentRowNumber]:self.B.indptr[self.currentRowNumber+1]])
+                self.currentRowData = list(self.B.data[self.B.indptr[self.currentRowNumber]:self.B.indptr[self.currentRowNumber+1]])
+                if self.currentRowNumber in self.prefetchBufferHash:
+                    self.currrentRowLoadingPointer = self.prefetchBufferHash[self.currentRowNumber]*48 #default is 0
+            
+            if self.currentRowNumber != -1:
+                self.DistanceListBuilder.sendInput()
+            self.currentRowSendingFinished = self.currentRowNumber == -1 
+
+    def input(self, col, length):
+        # add col to our input buffer
+        self.inputBuffer.append(col)
+        self.inputFlag = True
+        
+    def running(self, event):
+        while not self.endFlag:
+            time.sleep(0.0001)  
+            if not event.isSet():
+                self.cycle()
+                event.set()
+        event.set()
+    
+    
+    def setMultiplier(self,M:"MultiplierArray"):
+        self.multiplierArray = M
+    
+    def setDistanceListBuilder(self,DLB:"DistanceListBuilder"):
+        self.DistanceListBuilder = DLB
+    
+    def setMemory(self, M: "Memory"):
+        self.memory = M
+        
+        
+    def memoryAccess(self, numRows, rowNum, currentLocation):
+        if numRows == 0:
+            return
+        
+        # Each row is 48 elements, and each element is 12 bytes
+        numBytes = numRows * 48 * 12 
+        
+        # C finds us which channel we start at, and o finds us the offset from the beginning of the channel
+        # rowNum is the row we're pulling, and currentLocation is how far in we are at this point.
+        locationInList = self.B.indptr[rowNum] + currentLocation
+        O = (locationInList%64)
+        C = (locationInList//64)%8
+        # we request chunks of 8 bytes, that's the peak memory bandwidth anyway so we don't lose anything
+        # might be tempting to do chunks of 12 bytes, but that runs the risk of splitting across channels 
+        # and also makes the data end up streaming slower (taking 2 cycles instead of 1)
+        for x in range(0,(numBytes//8) + 1):
+            ms = min(8,numBytes)
+            self.memory.requestData(self,C,ms)
+            self.memoryAccessBytes += ms
+            numBytes -= ms
+            # increment offset. If we move to a new channel, increment the channel number mod 8
+            O += 8
+            O %= 64
+            if O < 8:
+                C += 1
+                C %= 8
+        self.rowsToFetch = numRows # when this hits 0, the B prefetcher is done loading all data
+    
+    
+    def cycle(self):
+        if self.endFlag or not self.inputFlag:
+            self.wastedCycles += 1
+            return
+        
+        # if we are doing prefetching, the code is basically identical with distance replaced with age
+        if self.isPrefetch:
+            if self.currentRowSendingFinished and self.nextRowLoadingFinished:
+                self.takeTimeStep()    
+            elif self.currentRowSendingFinished and not self.nextRowLoadingFinished:
+                self.memoryWastedCycles += 1
+            
+
+            # This is the part where we load a set of values into the multiplier array. Values are loaded 16 at a time
+            # if our row pointer has exceeded the current length of the data, we don't do anything
+            if not self.currentRowSendingFinished:
+                end = self.currentRowPointer + 16 if self.currentRowPointer + 16 < len(self.currentRowData) else len(self.currentRowData)
+                self.multiplierArray.loadBrow(self.currentRowData[self.currentRowPointer:end], self.currentRowIndices[self.currentRowPointer:end])
+                self.currentRowPointer += 16
+                # if we surpass the length of the current row after sending this data, we pop the row's row distance value and set a boolean
+                # representing that the loading is finished and we can move on to the next row if the next set is in the buffer.
+                if self.currentRowPointer >= len(self.currentRowData):
+                    self.rowAgeHash[self.currentRowNumber] = self.timeStep
+                    self.currentRowSendingFinished = True
+        
+            # This is the part where we load a row into buffer
+            # MemoryFlag is false when prefetcher is waiting for memory, and true when it isnt
+            if not self.nextRowLoadingFinished and self.rowsToFetch <= 0:                
+                if self.nextRowPointer >= len(self.nextRowData):
+                    self.nextRowLoadingFinished = True
+                    return
+                # Checks if the furthest row still has values to replace
+                if self.prefetchBufferHash[self.oldestRowInCache] != 0:                                                
+                    
+                    # Assumption made here: one element = one value/coordinate pair from the B matrix. 48 elements in each line.
+                    amountDataNeeded = min(self.prefetchBufferHash[self.oldestRowInCache] * 48, len(self.nextRowData) - self.nextRowPointer)
+                    
+                    self.nextRowPointer += amountDataNeeded # increment the row pointer by the amount of elements loaded into memory
+                    # Decrement the number of lines that are "eaten up" that were spilt
+                    amountDataNeeded = math.ceil(amountDataNeeded/48) # this is now in terms of the number of rows needed to be fetched
+                    self.prefetchBufferHash[self.oldestRowInCache] -= amountDataNeeded
+                    # Increment the number of lines that "replace" the previous row that was there
+                    if self.nextRowNumber in self.prefetchBufferHash:
+                        self.prefetchBufferHash[self.nextRowNumber] += amountDataNeeded
+                    else:
+                        self.prefetchBufferHash[self.nextRowNumber] = amountDataNeeded
+                    
+                    self.memoryAccess(amountDataNeeded, self.nextRowNumber, self.nextRowPointer) # pull indices and data into the buffer, this is counted in terms of prefetch buffer lines
+                else:
+                    # this code runs when the fetchers need a new place to fill in the buffer, it selects a oldest row, and deletes the current
+                    # oldest row in the prefetchBufferHash
+                    self.prefetchBufferHash.pop(self.oldestRowInCache)
+                    
+                    # we find a minimum time step last used, not a maximum next time of use!
+                    minimum = 1000000000000000
+                    for key in self.prefetchBufferHash:
+                        v = self.rowAgeHash[key]
+                        if v[0] < self.rowAgeHash[minimum]:
+                            minimum = key
+                    
+                    self.oldestRowInCache = minimum
+            elif self.rowsToFetch > 0:
+                # reduce the number of rows to fetch by one for every 48 bytes that get fetched
+                # since we don't use the bytes until the entire row is fetched, the order doesn't really matter anyway
+                while self.freeBytes >= 48 * 12:
+                    self.rowsToFetch -= 1
+                    self.freeBytes -= 48 * 12
+                return
+        else:
+            # if we are not doing prefetching, the code needs to be revamped
+            if self.currentRowSendingFinished and self.currentRowLoadingFinished:
+                self.takeTimeStep()    
+            elif not self.currentRowLoadingFinished:
+                self.memoryWastedCycles += 1
+            
+            # we only start sending once the loading is finished!
+            if not self.currentRowSendingFinished and self.currentRowLoadingFinished:
+                end = self.currentRowPointer + 16 if self.currentRowPointer + 16 < len(self.currentRowData) else len(self.currentRowData)
+                self.multiplierArray.loadBrow(self.currentRowData[self.currentRowPointer:end], self.currentRowIndices[self.currentRowPointer:end])
+                self.currentRowPointer += 16
+                if self.currentRowPointer >= len(self.currentRowData):
+                    self.rowAgeHash[self.currentRowNumber] = self.timeStep
+                    self.currentRowSendingFinished = True
+            # if loading isn't finished and we still have work to do:
+            elif not self.currentRowLoadingFinished and self.rowsToFetch <= 0:                
+                if self.currentRowLoadingPointer >= len(self.currentRowData):
+                    self.currentRowLoadingFinished = True
+                    return
+                # Checks if the furthest row still has values to replace
+                if self.prefetchBufferHash[self.oldestRowInCache] != 0:                                                
+                    
+                    # Assumption made here: one element = one value/coordinate pair from the B matrix. 48 elements in each line.
+                    amountDataNeeded = min(self.prefetchBufferHash[self.oldestRowInCache] * 48, len(self.currentRowData) - self.currentRowLoadingPointer)
+                    
+                    self.currentRowLoadingPointer += amountDataNeeded # increment the row pointer by the amount of elements loaded into memory
+                    # Decrement the number of lines that are "eaten up" that were spilt
+                    amountDataNeeded = math.ceil(amountDataNeeded/48) # this is now in terms of the number of rows needed to be fetched
+                    self.prefetchBufferHash[self.oldestRowInCache] -= amountDataNeeded
+                    # Increment the number of lines that "replace" the previous row that was there
+                    if self.currentRowNumber in self.prefetchBufferHash:
+                        self.prefetchBufferHash[self.currentRowNumber] += amountDataNeeded
+                    else:
+                        self.prefetchBufferHash[self.currentRowNumber] = amountDataNeeded
+                    
+                    self.memoryAccess(amountDataNeeded, self.currentRowNumber, self.currentRowLoadingPointer) # pull indices and data into the buffer, this is counted in terms of prefetch buffer lines
+                else:
+                    # this code runs when the fetchers need a new place to fill in the buffer, it selects a oldest row, and deletes the current
+                    # oldest row in the prefetchBufferHash
+                    self.prefetchBufferHash.pop(self.oldestRowInCache)
+                    
+                    # we find a minimum time step last used, not a maximum next time of use!
+                    minimum = 1000000000000000
+                    for key in self.prefetchBufferHash:
+                        v = self.rowAgeHash[key]
+                        if v[0] < self.rowAgeHash[minimum]:
+                            minimum = key
+                    
+                    self.oldestRowInCache = minimum
+            # if loading is in progress:
+            elif self.rowsToFetch > 0:
+                # reduce the number of rows to fetch by one for every 48 bytes that get fetched
+                # since we don't use the bytes until the entire row is fetched, the order doesn't really matter anyway
+                while self.freeBytes >= 48 * 12:
+                    self.rowsToFetch -= 1
+                    self.freeBytes -= 48 * 12
+                return
+            
+                
+             
+            
+                               
+       
+
 class MatrixBPrefetcher:
     
     """
@@ -332,7 +617,6 @@ class MatrixBPrefetcher:
         event.set()
     
     def takeTimeStep(self):
-        # set this true, if we see that there is input in the future, we set it back to false
         self.inputFlag = False
         self.timeStep += 1
         
@@ -627,7 +911,7 @@ class MergeTree:
         self.L5 = [[deque([]),True] for _ in range(2)]
         self.outputFifo = [[deque([]),True]]
         self.fifos = [self.inputFifos, self.L1, self.L2, self.L3, self.L4, self.L5, self.outputFifo]
-        self.out = []        
+        self.out = []
     
     def input(self, Mvals, cc):
         self.inputFifos[cc][0].extend(Mvals)
